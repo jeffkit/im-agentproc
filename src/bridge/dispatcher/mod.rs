@@ -82,7 +82,7 @@ pub async fn run_bridge_with_shutdown(
     info!(
         routing = %app.routing_label(),
         profiles = ?app.profile_names(),
-        "ilink-hub-bridge connected; waiting for getupdates"
+        "im-agentproc connected; waiting for getupdates"
     );
 
     loop {
@@ -137,7 +137,7 @@ pub async fn run_bridge_with_shutdown(
 pub async fn run_bridge(hub_url: String, token: String, app: BridgeApp) -> BridgeStop {
     // Legacy convenience entrypoint: assumes the stage-1 default (ilink via Hub).
     // Callers that need transport/via selection use `run_bridge_with_shutdown`
-    // with a self-built `Arc<dyn Transport>` (see `ilink-hub-bridge` binary).
+    // with a self-built `Arc<dyn Transport>` (see `im-agentproc` binary).
     let transport = match IlinkTransport::new(hub_url, token) {
         Ok(t) => Arc::new(t) as Arc<dyn Transport>,
         Err(e) => return BridgeStop::FatalCliError(e.to_string()),

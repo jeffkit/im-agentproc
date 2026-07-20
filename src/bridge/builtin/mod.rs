@@ -1,4 +1,4 @@
-//! Built-in profile handlers for `ilink-hub-bridge profile <type>`.
+//! Built-in profile handlers for `im-agentproc profile <type>`.
 //!
 //! Each handler reads the P0 env vars injected by the bridge and writes to stdout:
 //!   - Optional first line: `AGENT_SESSION:<uuid>`
@@ -27,7 +27,7 @@ mod recursive;
 
 /// Dispatch to a built-in profile handler by type name.
 ///
-/// Called from `ilink-hub-bridge profile <type>`.
+/// Called from `im-agentproc profile <type>`.
 pub async fn run_builtin_profile(profile_type: &str) -> anyhow::Result<()> {
     match profile_type {
         "claude-code" => claude_code::run().await,

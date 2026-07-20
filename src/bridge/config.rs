@@ -951,13 +951,13 @@ agentproc: {}
         // recursive has no in-process executor; it spawns the bridge builtin.
         let y = r#"
 agentproc:
-  command: ilink-hub-bridge
+  command: im-agentproc
   args: [profile, recursive]
   cwd: ~/projects/recursive
 "#;
         let app = parse(y).unwrap();
         let (_, p, _) = app.resolve("hi").unwrap();
-        assert_eq!(p.command, "ilink-hub-bridge");
+        assert_eq!(p.command, "im-agentproc");
         assert_eq!(p.args, vec!["profile", "recursive"]);
     }
 

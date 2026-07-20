@@ -1,13 +1,13 @@
 use std::path::{Path, PathBuf};
 
 #[cfg(windows)]
-const BRIDGE_BINARY_FILE: &str = "ilink-hub-bridge.exe";
+const BRIDGE_BINARY_FILE: &str = "im-agentproc.exe";
 #[cfg(not(windows))]
-const BRIDGE_BINARY_FILE: &str = "ilink-hub-bridge";
+const BRIDGE_BINARY_FILE: &str = "im-agentproc";
 
-/// Resolve the `ilink-hub-bridge` executable for spawning child bridge processes.
+/// Resolve the `im-agentproc` executable for spawning child bridge processes.
 ///
-/// When the current process is already `ilink-hub-bridge`, returns `current_exe()`.
+/// When the current process is already `im-agentproc`, returns `current_exe()`.
 /// Otherwise checks `ILINKHUB_BRIDGE_EXE`, a sibling binary next to `current_exe`,
 /// then `PATH`. Falls back to the bare command name.
 pub fn resolve_bridge_executable() -> PathBuf {
@@ -40,11 +40,11 @@ pub(super) fn is_bridge_executable(path: &Path) -> bool {
         .map(|name| {
             #[cfg(windows)]
             {
-                name.eq_ignore_ascii_case("ilink-hub-bridge.exe")
+                name.eq_ignore_ascii_case("im-agentproc.exe")
             }
             #[cfg(not(windows))]
             {
-                name == "ilink-hub-bridge"
+                name == "im-agentproc"
             }
         })
         .unwrap_or(false)
@@ -146,11 +146,11 @@ mod tests {
     fn resolve_bridge_executable_uses_non_empty_override_env() {
         temp_env::with_var(
             "ILINKHUB_BRIDGE_EXE",
-            Some("/tmp/custom-ilink-hub-bridge"),
+            Some("/tmp/custom-im-agentproc"),
             || {
                 assert_eq!(
                     resolve_bridge_executable(),
-                    PathBuf::from("/tmp/custom-ilink-hub-bridge")
+                    PathBuf::from("/tmp/custom-im-agentproc")
                 );
             },
         );
@@ -158,15 +158,15 @@ mod tests {
 
     #[test]
     fn is_bridge_executable_matches_exact_binary_name() {
-        assert!(is_bridge_executable(Path::new("/opt/bin/ilink-hub-bridge")));
-        assert!(is_bridge_executable(Path::new("ilink-hub-bridge")));
+        assert!(is_bridge_executable(Path::new("/opt/bin/im-agentproc")));
+        assert!(is_bridge_executable(Path::new("im-agentproc")));
     }
 
     #[test]
     fn is_bridge_executable_rejects_other_names() {
         assert!(!is_bridge_executable(Path::new("/opt/bin/ilink-hub")));
         assert!(!is_bridge_executable(Path::new(
-            "/opt/bin/ilink-hub-bridge-extra"
+            "/opt/bin/im-agentproc-extra"
         )));
         assert!(!is_bridge_executable(Path::new("/opt/bin/")));
         assert!(!is_bridge_executable(Path::new("")));

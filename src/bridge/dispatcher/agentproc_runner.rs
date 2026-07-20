@@ -1,7 +1,7 @@
 //! Bridge between ilink-hub's dispatcher and `agentproc::run`.
 //!
 //! This module replaces the old `executor::run_cli` call path: instead of
-//! spawning `ilink-hub-bridge profile <type>` as a subprocess and speaking
+//! spawning `im-agentproc profile <type>` as a subprocess and speaking
 //! AgentProc over its stdin/stdout, the dispatcher now drives `agentproc::run`
 //! directly — either in-process (when the profile sets a registered `executor`
 //! like `claude-code`) or via spawn (for custom `command:` profiles).

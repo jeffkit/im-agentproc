@@ -1,6 +1,6 @@
 //! Bridge manager: discover profile YAML files and supervise one bridge process per file.
 //!
-//! This is intentionally a thin supervisor. Each child is a normal `ilink-hub-bridge`
+//! This is intentionally a thin supervisor. Each child is a normal `im-agentproc`
 //! process, so message handling, Hub registration, session continuity, and CLI execution
 //! continue to live in the existing bridge implementation.
 
@@ -1113,7 +1113,7 @@ fn direct_cred_wait_error(spec: &BridgeProcessSpec) -> String {
     format!(
         "via: direct profile has no usable saved credential at {}; refusing to spawn \
          (interactive QR login is unsafe under the manager). Run once: \
-         `ilink-hub-bridge --config {} --cred-file {} --pair` to provision, then this \
+         `im-agentproc --config {} --cred-file {} --pair` to provision, then this \
          profile starts automatically on the next scan.",
         spec.cred_path.display(),
         spec.config_path.display(),
@@ -1180,7 +1180,7 @@ mod tests {
 
     fn temp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "ilink-hub-bridge-manager-test-{name}-{}",
+            "im-agentproc-manager-test-{name}-{}",
             uuid::Uuid::new_v4()
         ));
         fs::create_dir_all(&dir).unwrap();

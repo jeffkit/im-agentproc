@@ -208,9 +208,9 @@ async fn register_via_hub_http(
         .await
         .with_context(|| {
             format!(
-                "无法连接 Hub（{url}）。`ilink-hub-bridge` 不要求本机安装或运行 `ilink-hub`，\
+                "无法连接 Hub（{url}）。`im-agentproc` 不要求本机安装或运行 `ilink-hub`，\
                  只需 `WEIXIN_BASE_URL` 指向**已启动且可达**的 Hub（本机或远程均可）。\
-                 若 Hub 未就绪：先启动 Hub 或改 URL；也可改用环境变量 `WEIXIN_TOKEN`，或在 Hub 可用时使用 `ilink-hub-bridge --pair` 扫码配对。"
+                 若 Hub 未就绪：先启动 Hub 或改 URL；也可改用环境变量 `WEIXIN_TOKEN`，或在 Hub 可用时使用 `im-agentproc --pair` 扫码配对。"
             )
         })?;
     let resp: serde_json::Value = resp.json().await.context("parse /hub/register response")?;
@@ -397,7 +397,7 @@ pub async fn resolve_hub_connection(
     if let Some(tok) = explicit_token.map(str::trim).filter(|s| !s.is_empty()) {
         validate_hub_token(&hub, tok).await.with_context(|| {
             "WEIXIN_TOKEN / --token 未被当前 Hub 接受（未注册或已失效）。\
-                 请用 `ilink-hub register` 或 `ilink-hub-bridge --force-register` 重新注册。"
+                 请用 `ilink-hub register` 或 `im-agentproc --force-register` 重新注册。"
         })?;
         return Ok((hub, tok.to_string()));
     }
@@ -587,7 +587,7 @@ async fn qr_login_and_save_direct(
         anyhow::bail!(
             "via: direct 需要扫码登录真实上游 {base}，但当前为非交互环境（manager 托管 / \
              `--no-interactive` / 非 TTY），无法完成扫码。请先在交互终端手动执行一次：\n  \
-             ilink-hub-bridge --config {cfg} --cred-file {cred} --pair\n\
+             im-agentproc --config {cfg} --cred-file {cred} --pair\n\
              完成扫码并存盘后，再交由 manager 托管或重启 bridge。",
             cfg = config_path
                 .map(|p| p.display().to_string())

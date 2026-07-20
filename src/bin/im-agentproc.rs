@@ -11,7 +11,7 @@
 //!
 //! **调试**：`ILINKHUB_BRIDGE_DUMP_MSG=1`（或 `true` / `yes`）时在 stderr 打印每条入站的完整 `WeixinMessage` JSON 与各 `item_list[*].extra`。
 //!
-//! **内置 Profile**：`ilink-hub-bridge profile <type>` 运行内置 profile 处理器（如 `claude-code`），
+//! **内置 Profile**：`im-agentproc profile <type>` 运行内置 profile 处理器（如 `claude-code`），
 //! 遵循 P0 exec 协议：从 `AGENT_*` 环境变量读取输入，向 stdout 写出回复。
 //!
 //! 配置见 `docs/bridge/README.md`，内置 profile 规范见 `docs/bridge/profile-spec.md`。
@@ -110,7 +110,7 @@ struct Cli {
 enum Commands {
     /// Run a built-in profile handler (P0 exec protocol: reads AGENT_* env vars, writes to stdout).
     ///
-    /// Example: ilink-hub-bridge profile claude-code
+    /// Example: im-agentproc profile claude-code
     ///
     /// Built-in types:
     ///   claude-code   Wrap the `claude` CLI with automatic --resume session continuity
@@ -467,7 +467,7 @@ async fn main() -> Result<()> {
                                 let hint = if via.is_direct() {
                     "via: direct 下请重新 `--pair` 扫码登录真实上游，或更换为有效的 WEIXIN_TOKEN。"
                                 } else {
-                    "via: hub 下请重新执行 `ilink-hub register` 或 `ilink-hub-bridge --force-register`。"
+                    "via: hub 下请重新执行 `ilink-hub register` 或 `im-agentproc --force-register`。"
                                 };
                                 anyhow::bail!(
                                     "WEIXIN_TOKEN / --token 被拒绝（未注册或已失效）。{hint}"
@@ -581,14 +581,9 @@ mod tests {
         // N1 regression guard: `--no-interactive` must be a bare SetTrue flag
         // (the manager passes it bare to children). The env form only accepts
         // "true"/"false", so the manager must NOT inject "1" via env.
-        let cli = Cli::parse_from([
-            "ilink-hub-bridge",
-            "--no-interactive",
-            "--hub-url",
-            "http://x",
-        ]);
+        let cli = Cli::parse_from(["im-agentproc", "--no-interactive", "--hub-url", "http://x"]);
         assert!(cli.no_interactive);
-        let cli = Cli::parse_from(["ilink-hub-bridge", "--hub-url", "http://x"]);
+        let cli = Cli::parse_from(["im-agentproc", "--hub-url", "http://x"]);
         assert!(!cli.no_interactive);
     }
 
@@ -602,7 +597,7 @@ mod tests {
             "agentproc:\n  command: echo\n  args: [\"ok\"]\nvia: direct\n",
         );
         let app = BridgeApp::load(&cfg).unwrap();
-        let cli = Cli::parse_from(["ilink-hub-bridge", "--hub-url", "http://127.0.0.1:8765"]);
+        let cli = Cli::parse_from(["im-agentproc", "--hub-url", "http://127.0.0.1:8765"]);
         let rt = tokio::runtime::Runtime::new().unwrap();
         let err = match rt.block_on(build_transport(&app, &cli, &cfg, None, true)) {
             Ok(_) => panic!("expected M2 bail, got transport"),
@@ -624,7 +619,7 @@ mod tests {
             "agentproc:\n  command: echo\n  args: [\"ok\"]\ntransport: wecom\n",
         );
         let app = BridgeApp::load(&cfg).unwrap();
-        let cli = Cli::parse_from(["ilink-hub-bridge", "--hub-url", "http://127.0.0.1:8765"]);
+        let cli = Cli::parse_from(["im-agentproc", "--hub-url", "http://127.0.0.1:8765"]);
         let rt = tokio::runtime::Runtime::new().unwrap();
         let err = match rt.block_on(build_transport(&app, &cli, &cfg, None, true)) {
             Ok(_) => panic!("expected L4 bail, got transport"),
