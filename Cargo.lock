@@ -4,8 +4,9 @@ version = 4
 
 [[package]]
 name = "agentproc"
-version = "0.10.0"
-source = "git+https://github.com/jeffkit/agentproc.git?rev=dbe2b21#dbe2b2151164c911001bd65835f246aca5c361b2"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "46e68c61fd7b42e8389fe7e36618275619000a4f5c948a126d34bde23617ce8d"
 dependencies = [
  "async-trait",
  "base64",
