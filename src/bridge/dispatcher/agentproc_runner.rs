@@ -105,14 +105,14 @@ pub(super) async fn run_via_agentproc(
     let partial_count = Arc::new(AtomicU32::new(0));
     let partial_tx_for_cb = partial_tx.clone();
     let partial_count_for_cb = Arc::clone(&partial_count);
-    let session_id_for_cb: Arc<tokio::sync::Mutex<String>> =
-        Arc::new(tokio::sync::Mutex::new(session_id.to_string()));
+    let session_id_for_cb: Arc<std::sync::Mutex<String>> =
+        Arc::new(std::sync::Mutex::new(session_id.to_string()));
 
     let on_partial = Arc::new(move |text: String, sid: Option<String>| {
         partial_count_for_cb.fetch_add(1, Ordering::Relaxed);
         if let Some(s) = sid {
             if !s.is_empty() {
-                *session_id_for_cb.blocking_lock() = s;
+                *session_id_for_cb.lock().unwrap() = s;
             }
         }
         let _ = partial_tx_for_cb.send(Some(text));
