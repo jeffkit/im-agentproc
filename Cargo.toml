@@ -1,6 +1,6 @@
 [package]
 name = "im-agentproc"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "IM-side runtime for the agentproc ecosystem: bridge an IM transport (iLink/WeChat today) to local coding CLIs (Claude Code, Codex, …) via agentproc profiles."
 license = "MIT"
@@ -57,7 +57,7 @@ futures-util = "0.3"
 
 # AgentProc SDK — protocol layer (turn object, NDJSON events, run()).
 # Published to crates.io (0.11+); previously a git rev pin.
-agentproc = "0.11"
+agentproc = "0.11.1"
 
 [dev-dependencies]
 tempfile = "3"
