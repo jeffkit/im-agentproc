@@ -5,7 +5,9 @@ export default defineConfig({
   description: 'IM-side runtime for the agentproc ecosystem — bridge an IM transport to local coding CLIs via agentproc profiles',
   lang: 'en-US',
 
-  base: '/',
+  // Published at https://jeffkit.github.io/im-agentproc/ (GitHub Pages project site).
+  // Change this (or set a CNAME + '/') if a custom domain is bound later.
+  base: '/im-agentproc/',
 
   locales: {
     root: {
