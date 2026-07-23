@@ -1,7 +1,7 @@
 //! CLI bridge: connect to iLink Hub as a virtual-token backend and run one
 //! agentproc profile (one YAML file == one profile) per text message.
 //!
-//! Used by the `im-agentproc` binary; see `docs/bridge/README.md`.
+//! Used by the `im-agentproc` binary; see `docs/bridge/index.md`.
 
 pub mod builtin;
 mod config;

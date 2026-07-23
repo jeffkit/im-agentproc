@@ -14,7 +14,7 @@
 //! **内置 Profile**：`im-agentproc profile <type>` 运行内置 profile 处理器（如 `claude-code`），
 //! 遵循 P0 exec 协议：从 `AGENT_*` 环境变量读取输入，向 stdout 写出回复。
 //!
-//! 配置见 `docs/bridge/README.md`，内置 profile 规范见 `docs/bridge/profile-spec.md`。
+//! 配置见 `docs/bridge/index.md`，内置 profile 规范见 `docs/bridge/profile-spec.md`。
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
