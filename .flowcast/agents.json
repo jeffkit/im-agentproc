@@ -1,0 +1,38 @@
+{
+  "//": "im-agentproc agent pool（项目级）。参照 ilink-hub 的配置。deepseek/minimax 走 provider 网关（不依赖 claude 登录）；claude 需 claude auth login。pge --agent deepseek 会自动回退 planner/evaluator 到 deepseek。",
+  "agents": {
+    "deepseek": {
+      "executor": "claude",
+      "provider": "anthropic-deepseek",
+      "timeout": 600000,
+      "extraArgs": [
+        "--dangerously-skip-permissions"
+      ]
+    },
+    "minimax": {
+      "executor": "claude",
+      "provider": "anthropic-minimax",
+      "timeout": 600000,
+      "extraArgs": [
+        "--dangerously-skip-permissions"
+      ]
+    },
+    "claude": {
+      "executor": "claude",
+      "timeout": 600000,
+      "extraArgs": [
+        "--dangerously-skip-permissions"
+      ]
+    },
+    "claude-reviewer": {
+      "_comment": "reviewer profile：Rust 异步/并发专家视角，用于 evaluator 角色。",
+      "executor": "claude",
+      "provider": "anthropic-minimax",
+      "timeout": 300000,
+      "extraArgs": [
+        "--dangerously-skip-permissions"
+      ],
+      "extraPromptPrefix": "你是 Rust 异步运行时与 IM 桥接专家，重点审查：tokio 异步陷阱、WebSocket 生命周期、MCP 协议一致性、错误处理是否用 thiserror 而非裸 unwrap。"
+    }
+  }
+}
