@@ -26,11 +26,18 @@ use tracing::{info, warn};
 use std::io::IsTerminal;
 
 use anyhow::Context;
-use im_agentproc::bridge::transport::{IlinkTransport, NullTransport, Transport};
+use im_agentproc::bridge::transport::{
+    DiscordTransport, FeishuTransport, IlinkTransport, NullTransport, TelegramTransport, Transport,
+    WecomTransport,
+};
 use im_agentproc::bridge::{
     builtin, default_direct_credential_path, default_local_credential_path,
     resolve_direct_connection, resolve_hub_connection, run_bridge_with_shutdown, BridgeApp,
     BridgeStop, Via,
+};
+use im_agentproc::mcp::{
+    run_server, OutboundDelivery, SendFileTool, SendImageTool, SendTextTool, SendVoiceTool,
+    ServerConfig, ToolRegistry,
 };
 use im_agentproc::paths::{
     default_bridge_config_path, default_bridge_manager_credentials_dir, default_bridge_profiles_dir,
@@ -119,6 +126,20 @@ enum Commands {
         #[arg(value_name = "TYPE")]
         profile_type: String,
     },
+    /// Run the MCP stdio server that exposes outbound delivery tools
+    /// (`send_text` / `send_image` / `send_file` / `send_voice`) to a hub
+    /// profile child process.
+    ///
+    /// The bridge manager launches this sub-process with a transport and
+    /// inbound context already resolved; the sub-process reads
+    /// `IM_AGENTPROC_MCP_*` env vars to discover what to serve.
+    ///
+    /// Example:
+    ///   IM_AGENTPROC_MCP_TRANSPORT=feishu \
+    ///   IM_AGENTPROC_MCP_CONTEXT_TOKEN=oc_xxx \
+    ///   IM_AGENTPROC_MCP_TO_USER=user_1 \
+    ///   im-agentproc mcp-server
+    McpServer,
     /// Discover profile YAML files and supervise one bridge workspace per file.
     ///
     /// Each `*.yaml` / `*.yml` file keeps the existing bridge YAML format. The manager derives a
@@ -203,17 +224,90 @@ fn resolve_direct_base_url(direct_base_url: Option<&str>, cli_hub_url: &str) -> 
 
 /// Build the configured transport for the bridge run.
 ///
-/// - `transport: ilink` + `via: hub` (default): resolve a virtual token via the Hub
-///   (`/hub/register` / QR) and point `IlinkTransport` at the Hub.
-/// - `transport: ilink` + `via: direct`: connect straight to the real iLink
-///   upstream. Stage 3 resolves credentials via: explicit `WEIXIN_TOKEN` →
-///   `--pair` QR login against the real upstream → saved direct cred file.
-///   The upstream base URL is `base_url:` from the YAML when set, else a
-///   non-default `--hub-url` / `WEIXIN_BASE_URL` (a localhost/default URL is
-///   rejected to avoid silently targeting a Hub — review M2).
+/// - `transport: ilink` (default): resolve credentials via Hub or direct iLink.
+/// - `transport: telegram`: Telegram Bot API long-poll. Requires `im_credentials.token`.
+/// - `transport: wecom`: WeCom smart-bot WebSocket. Requires `im_credentials.bot_id` + `bot_secret`.
+/// - `transport: feishu`: Feishu WebSocket long connection. Requires `im_credentials.app_id` + `app_secret`.
+/// - `transport: discord`: Discord Gateway WebSocket. Requires `im_credentials.token`.
 /// - `transport: <other>`: load a `NullTransport` placeholder only when
-///   `--allow-null-transport` is set; otherwise fail fast (the placeholder would
-///   otherwise back off forever as a zombie — review L4).
+///   `--allow-null-transport` is set; otherwise fail fast.
+async fn run_mcp_server() -> Result<()> {
+    use std::sync::Arc;
+
+    // The bridge manager launches this sub-process after resolving the
+    // transport + inbound context. We read those from env vars here.
+    let transport_name = std::env::var("IM_AGENTPROC_MCP_TRANSPORT")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "IM_AGENTPROC_MCP_TRANSPORT is required (one of ilink/telegram/wecom/feishu/discord)"
+            )
+        })?;
+    let context_token = std::env::var("IM_AGENTPROC_MCP_CONTEXT_TOKEN")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("IM_AGENTPROC_MCP_CONTEXT_TOKEN is required"))?;
+    let to_user = std::env::var("IM_AGENTPROC_MCP_TO_USER").unwrap_or_default();
+
+    let transport = resolve_mcp_transport(&transport_name)?;
+
+    let delivery = Arc::new(OutboundDelivery::new(transport, context_token, to_user));
+    let mut registry = ToolRegistry::default();
+    registry.register(Arc::new(SendTextTool {
+        delivery: delivery.clone(),
+    }));
+    registry.register(Arc::new(SendImageTool {
+        delivery: delivery.clone(),
+    }));
+    registry.register(Arc::new(SendFileTool {
+        delivery: delivery.clone(),
+    }));
+    registry.register(Arc::new(SendVoiceTool { delivery }));
+
+    let cfg = ServerConfig::new(Arc::new(registry));
+    run_server(cfg).await
+}
+
+/// Build the [`Transport`] for the MCP sub-process from `IM_AGENTPROC_MCP_*`
+/// env vars. Credentials are pulled from env so the manager doesn't have to
+/// leak them through argv (which is visible in `ps(1)`).
+///
+/// Synchronous so unit tests can call it without spinning up a Tokio runtime.
+fn resolve_mcp_transport(transport_name: &str) -> Result<Arc<dyn Transport>> {
+    use std::sync::Arc;
+    let env_var = |key: &str| -> Result<String> {
+        std::env::var(key)
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("{key} is required"))
+    };
+    let transport: Arc<dyn Transport> = match transport_name {
+        "telegram" => Arc::new(TelegramTransport::new(env_var(
+            "IM_AGENTPROC_MCP_TELEGRAM_TOKEN",
+        )?)?),
+        "feishu" => Arc::new(FeishuTransport::new(
+            env_var("IM_AGENTPROC_MCP_FEISHU_APP_ID")?,
+            env_var("IM_AGENTPROC_MCP_FEISHU_APP_SECRET")?,
+        )?),
+        "wecom" => Arc::new(WecomTransport::new(
+            env_var("IM_AGENTPROC_MCP_WECOM_BOT_ID")?,
+            env_var("IM_AGENTPROC_MCP_WECOM_BOT_SECRET")?,
+        )),
+        "discord" => Arc::new(DiscordTransport::new(env_var(
+            "IM_AGENTPROC_MCP_DISCORD_TOKEN",
+        )?)?),
+        "ilink" => Arc::new(IlinkTransport::new(
+            env_var("IM_AGENTPROC_MCP_ILINK_HUB_URL")?,
+            env_var("IM_AGENTPROC_MCP_ILINK_TOKEN")?,
+        )?),
+        other => anyhow::bail!(
+            "unknown transport `{other}` for mcp-server; expected ilink/telegram/wecom/feishu/discord"
+        ),
+    };
+    Ok(transport)
+}
+
 async fn build_transport(
     app: &BridgeApp,
     cli: &Cli,
@@ -222,18 +316,138 @@ async fn build_transport(
     interactive: bool,
 ) -> Result<Arc<dyn Transport>> {
     let transport = app.transport();
-    if !transport.is_ilink() {
-        let name = transport.as_str().to_string();
-        if !cli.allow_null_transport {
-            anyhow::bail!(
-                "transport `{name}` 没有真实适配器（占位 NullTransport 会永久退避成僵尸进程）。\
-                 如仅为可插拔冒烟测试，请加 `--allow-null-transport` 显式开启占位。"
-            );
-        }
-        info!(transport = %name, "loading placeholder transport (allow_null_transport)");
-        return Ok(Arc::new(NullTransport::new(name)));
-    }
+    let creds = app.im_credentials();
 
+    let t: Arc<dyn Transport> = match transport.as_str() {
+        "ilink" => build_ilink_transport(app, cli, config_path, description, interactive).await?,
+
+        "telegram" => {
+            let token = creds
+                .get("token")
+                .filter(|s| !s.trim().is_empty())
+                .cloned()
+                .or_else(|| {
+                    std::env::var("TELEGRAM_BOT_TOKEN")
+                        .ok()
+                        .filter(|s| !s.trim().is_empty())
+                })
+                .context(
+                    "transport: telegram 需要 im_credentials.token 或环境变量 TELEGRAM_BOT_TOKEN",
+                )?;
+            info!(
+                transport = "telegram",
+                "building Telegram Bot API transport"
+            );
+            Arc::new(TelegramTransport::new(token).context("build Telegram transport")?)
+        }
+
+        "wecom" => {
+            let bot_id = creds
+                .get("bot_id")
+                .filter(|s| !s.trim().is_empty())
+                .cloned()
+                .or_else(|| {
+                    std::env::var("WECOM_BOT_ID")
+                        .ok()
+                        .filter(|s| !s.trim().is_empty())
+                })
+                .context("transport: wecom 需要 im_credentials.bot_id 或环境变量 WECOM_BOT_ID")?;
+            let bot_secret = creds
+                .get("bot_secret")
+                .filter(|s| !s.trim().is_empty())
+                .cloned()
+                .or_else(|| {
+                    std::env::var("WECOM_BOT_SECRET")
+                        .ok()
+                        .filter(|s| !s.trim().is_empty())
+                })
+                .context(
+                    "transport: wecom 需要 im_credentials.bot_secret 或环境变量 WECOM_BOT_SECRET",
+                )?;
+            info!(
+                transport = "wecom",
+                "building WeCom Bot WebSocket transport"
+            );
+            Arc::new(WecomTransport::new(bot_id, bot_secret))
+        }
+
+        "feishu" => {
+            let app_id = creds
+                .get("app_id")
+                .filter(|s| !s.trim().is_empty())
+                .cloned()
+                .or_else(|| {
+                    std::env::var("FEISHU_APP_ID")
+                        .ok()
+                        .filter(|s| !s.trim().is_empty())
+                })
+                .context("transport: feishu 需要 im_credentials.app_id 或环境变量 FEISHU_APP_ID")?;
+            let app_secret = creds
+                .get("app_secret")
+                .filter(|s| !s.trim().is_empty())
+                .cloned()
+                .or_else(|| {
+                    std::env::var("FEISHU_APP_SECRET")
+                        .ok()
+                        .filter(|s| !s.trim().is_empty())
+                })
+                .context(
+                    "transport: feishu 需要 im_credentials.app_secret 或环境变量 FEISHU_APP_SECRET",
+                )?;
+            info!(transport = "feishu", "building Feishu WebSocket transport");
+            Arc::new(FeishuTransport::new(app_id, app_secret).context("build Feishu transport")?)
+        }
+
+        "discord" => {
+            let token = creds
+                .get("token")
+                .filter(|s| !s.trim().is_empty())
+                .cloned()
+                .or_else(|| {
+                    std::env::var("DISCORD_BOT_TOKEN")
+                        .ok()
+                        .filter(|s| !s.trim().is_empty())
+                })
+                .context(
+                    "transport: discord 需要 im_credentials.token 或环境变量 DISCORD_BOT_TOKEN",
+                )?;
+            info!(
+                transport = "discord",
+                "building Discord Gateway WebSocket transport"
+            );
+            Arc::new(DiscordTransport::new(token).context("build Discord transport")?)
+        }
+
+        name => {
+            if !cli.allow_null_transport {
+                anyhow::bail!(
+                    "transport `{name}` 没有真实适配器（占位 NullTransport 会永久退避成僵尸进程）。\
+                     如仅为可插拔冒烟测试，请加 `--allow-null-transport` 显式开启占位。"
+                );
+            }
+            info!(transport = %name, "loading placeholder transport (allow_null_transport)");
+            Arc::new(NullTransport::new(name.to_string()))
+        }
+    };
+
+    let caps = t.capabilities();
+    info!(
+        transport = transport.as_str(),
+        media_upload = caps.media_upload,
+        "transport built"
+    );
+    Ok(t)
+}
+
+/// Build the iLink transport (Hub or Direct). Extracted from the main `build_transport`
+/// to keep it readable.
+async fn build_ilink_transport(
+    app: &BridgeApp,
+    cli: &Cli,
+    config_path: &Path,
+    description: Option<&str>,
+    interactive: bool,
+) -> Result<Arc<dyn Transport>> {
     let t: Arc<dyn Transport> = match app.via() {
         Via::Hub => {
             let (hub_url, token) = resolve_hub_connection(
@@ -251,11 +465,6 @@ async fn build_transport(
             Arc::new(IlinkTransport::new(hub_url, token).context("build iLink transport")?)
         }
         Via::Direct => {
-            // YAML `base_url:` overrides the CLI/env URL for this profile, so a
-            // bridge manager can mix hub and direct profiles against different
-            // upstreams. Without `base_url:`, require a non-default `--hub-url` /
-            // `WEIXIN_BASE_URL` — refusing the localhost Hub default avoids
-            // silently pointing a direct bridge at a Hub (review M2).
             let base = resolve_direct_base_url(app.direct_base_url(), &cli.hub_url)?;
             let (base, token) = resolve_direct_connection(
                 &base,
@@ -268,19 +477,14 @@ async fn build_transport(
             )
             .await?;
             info!(base = %base, via = "direct", "connecting directly to iLink upstream");
-            // direct mode cannot resume CLI sessions across messages (the real
-            // upstream does not echo the HubExt session_id the Hub persists).
             info!(
                 "via: direct 不支持跨消息 CLI 会话续接（真实上游不回显 session_id）；每条消息起新 CLI 会话。"
             );
-            let t = IlinkTransport::new(base, token).context("build iLink transport (direct)")?;
-            Arc::new(t)
+            Arc::new(IlinkTransport::new(base, token).context("build iLink transport (direct)")?)
         }
     };
-    // N4: log capabilities at the common exit so both hub and direct paths are
-    // observable (review M6). media_upload is not implemented for iLink today.
     let caps = t.capabilities();
-    info!(media_upload = caps.media_upload, "transport capabilities");
+    info!(via = ?app.via(), media_upload = caps.media_upload, "iLink transport capabilities");
     Ok(t)
 }
 
@@ -320,6 +524,7 @@ async fn main() -> Result<()> {
             // No Hub connection needed — just read env vars and write to stdout.
             builtin::run_builtin_profile(profile_type).await
         }
+        Some(Commands::McpServer) => run_mcp_server().await,
         Some(Commands::Manager {
             profiles_dir,
             credentials_dir,
@@ -541,6 +746,25 @@ mod tests {
         p
     }
 
+    /// Global mutex serialising any test that mutates process env. Tests run
+    /// in parallel by default, but `std::env::set_var` / `remove_var` mutate
+    /// shared global state and would race otherwise.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Clear IM-credential env vars that build_transport falls back to.
+    /// Held under `ENV_LOCK` so no other test can re-set them mid-flight.
+    fn clear_im_credential_env() {
+        // SAFETY: caller holds ENV_LOCK.
+        unsafe {
+            std::env::remove_var("TELEGRAM_BOT_TOKEN");
+            std::env::remove_var("DISCORD_BOT_TOKEN");
+            std::env::remove_var("WECOM_BOT_ID");
+            std::env::remove_var("WECOM_BOT_SECRET");
+            std::env::remove_var("FEISHU_APP_ID");
+            std::env::remove_var("FEISHU_APP_SECRET");
+        }
+    }
+
     #[test]
     fn resolve_direct_base_url_rejects_default_hub_url_without_base_url() {
         // M2: via: direct, no `base_url:`, CLI hub-url at the localhost default → bail.
@@ -611,12 +835,12 @@ mod tests {
     }
 
     #[test]
-    fn build_transport_non_ilink_transport_bails_without_allow_flag() {
-        // L4: a non-ilink transport fails fast unless --allow-null-transport is set.
+    fn build_transport_unknown_transport_bails_without_allow_flag() {
+        // L4: an unknown transport fails fast unless --allow-null-transport is set.
         let dir = tempfile::tempdir().unwrap();
         let cfg = write_yaml(
             dir.path(),
-            "agentproc:\n  command: echo\n  args: [\"ok\"]\ntransport: wecom\n",
+            "agentproc:\n  command: echo\n  args: [\"ok\"]\ntransport: foobar-unknown\n",
         );
         let app = BridgeApp::load(&cfg).unwrap();
         let cli = Cli::parse_from(["im-agentproc", "--hub-url", "http://127.0.0.1:8765"]);
@@ -627,8 +851,248 @@ mod tests {
         };
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("wecom") && msg.contains("--allow-null-transport"),
+            msg.contains("foobar-unknown") && msg.contains("--allow-null-transport"),
             "expected L4 bail mentioning transport + flag: {msg}"
+        );
+    }
+
+    #[test]
+    fn build_transport_wecom_bails_without_credentials() {
+        // wecom is a real transport; without credentials it should bail fast.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_im_credential_env();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = write_yaml(
+            dir.path(),
+            "agentproc:\n  command: echo\n  args: [\"ok\"]\ntransport: wecom\n",
+        );
+        let app = BridgeApp::load(&cfg).unwrap();
+        let cli = Cli::parse_from(["im-agentproc", "--hub-url", "http://127.0.0.1:8765"]);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let err = match rt.block_on(build_transport(&app, &cli, &cfg, None, true)) {
+            Ok(_) => panic!("expected credential bail, got transport"),
+            Err(e) => e,
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.to_lowercase().contains("bot_id") || msg.to_lowercase().contains("wecom"),
+            "expected missing credentials error: {msg}"
+        );
+    }
+
+    #[test]
+    fn build_transport_telegram_bails_without_token() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_im_credential_env();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = write_yaml(
+            dir.path(),
+            "agentproc:\n  command: echo\n  args: [\"ok\"]\ntransport: telegram\n",
+        );
+        let app = BridgeApp::load(&cfg).unwrap();
+        let cli = Cli::parse_from(["im-agentproc", "--hub-url", "http://127.0.0.1:8765"]);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let err = match rt.block_on(build_transport(&app, &cli, &cfg, None, true)) {
+            Ok(_) => panic!("expected credential bail, got transport"),
+            Err(e) => e,
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.to_lowercase().contains("token") && msg.to_lowercase().contains("telegram"),
+            "expected telegram/token error: {msg}"
+        );
+    }
+
+    #[test]
+    fn build_transport_feishu_bails_without_app_secret() {
+        // Only app_id is set; the second secret check should fire.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_im_credential_env();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = write_yaml(
+            dir.path(),
+            "agentproc:\n  command: echo\n  args: [\"ok\"]\n\
+             transport: feishu\n\
+             im_credentials:\n  app_id: \"cli_xxx\"\n",
+        );
+        let app = BridgeApp::load(&cfg).unwrap();
+        let cli = Cli::parse_from(["im-agentproc", "--hub-url", "http://127.0.0.1:8765"]);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let err = match rt.block_on(build_transport(&app, &cli, &cfg, None, true)) {
+            Ok(_) => panic!("expected credential bail, got transport"),
+            Err(e) => e,
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("app_secret") && msg.contains("feishu"),
+            "expected feishu/app_secret error: {msg}"
+        );
+    }
+
+    #[test]
+    fn build_transport_wecom_bails_without_bot_secret() {
+        // bot_id is set but bot_secret isn't — the second secret check should fire.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_im_credential_env();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = write_yaml(
+            dir.path(),
+            "agentproc:\n  command: echo\n  args: [\"ok\"]\n\
+             transport: wecom\n\
+             im_credentials:\n  bot_id: \"wxyz\"\n",
+        );
+        let app = BridgeApp::load(&cfg).unwrap();
+        let cli = Cli::parse_from(["im-agentproc", "--hub-url", "http://127.0.0.1:8765"]);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let err = match rt.block_on(build_transport(&app, &cli, &cfg, None, true)) {
+            Ok(_) => panic!("expected credential bail, got transport"),
+            Err(e) => e,
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("bot_secret") && msg.contains("wecom"),
+            "expected wecom/bot_secret error: {msg}"
+        );
+    }
+
+    #[test]
+    fn build_transport_discord_bails_without_token() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_im_credential_env();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = write_yaml(
+            dir.path(),
+            "agentproc:\n  command: echo\n  args: [\"ok\"]\ntransport: discord\n",
+        );
+        let app = BridgeApp::load(&cfg).unwrap();
+        let cli = Cli::parse_from(["im-agentproc", "--hub-url", "http://127.0.0.1:8765"]);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let err = match rt.block_on(build_transport(&app, &cli, &cfg, None, true)) {
+            Ok(_) => panic!("expected credential bail, got transport"),
+            Err(e) => e,
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.to_lowercase().contains("token") && msg.to_lowercase().contains("discord"),
+            "expected discord/token error: {msg}"
+        );
+    }
+
+    // ── resolve_mcp_transport env-var wiring ─────────────────────────────────
+    // We serialise on the same ENV_LOCK + clear_im_credential_env helper used
+    // by the factory tests so concurrent runs can't race on env reads.
+    #[test]
+    fn resolve_mcp_transport_unknown_name_bails() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_im_credential_env();
+        match resolve_mcp_transport("webex") {
+            Err(err) => assert!(format!("{err:#}").contains("unknown transport")),
+            Ok(_) => panic!("expected unknown-transport error"),
+        }
+    }
+
+    #[test]
+    fn resolve_mcp_transport_telegram_missing_token_bails() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_im_credential_env();
+        match resolve_mcp_transport("telegram") {
+            Err(err) => assert!(format!("{err:#}").contains("TELEGRAM_TOKEN")),
+            Ok(_) => panic!("expected missing-credential error"),
+        }
+    }
+
+    #[test]
+    fn resolve_mcp_transport_feishu_missing_app_secret_bails() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_im_credential_env();
+        // SAFETY: held under ENV_LOCK.
+        unsafe {
+            std::env::set_var("IM_AGENTPROC_MCP_FEISHU_APP_ID", "cli_x");
+        }
+        let result = resolve_mcp_transport("feishu");
+        unsafe {
+            std::env::remove_var("IM_AGENTPROC_MCP_FEISHU_APP_ID");
+        }
+        match result {
+            Err(err) => assert!(format!("{err:#}").contains("FEISHU_APP_SECRET")),
+            Ok(_) => panic!("expected missing-credential error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_mcp_transport_discord_succeeds_when_token_set() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_im_credential_env();
+        // SAFETY: held under ENV_LOCK.
+        unsafe {
+            std::env::set_var("IM_AGENTPROC_MCP_DISCORD_TOKEN", "test-discord");
+        }
+        // DiscordTransport::new spawns a WS worker that will fail to
+        // connect to the real Gateway — that's fine; we only need to verify
+        // the env-var → Transport construction chain works.
+        let result = resolve_mcp_transport("discord");
+        unsafe {
+            std::env::remove_var("IM_AGENTPROC_MCP_DISCORD_TOKEN");
+        }
+        let transport = result.expect("DiscordTransport should build from env");
+        assert_eq!(transport.name(), "discord");
+        assert!(transport.capabilities().media_upload);
+    }
+
+    #[test]
+    fn build_transport_unknown_transport_succeeds_with_allow_flag() {
+        // With --allow-null-transport, an unknown transport loads a NullTransport
+        // placeholder instead of failing. Confirms the escape hatch actually works.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = write_yaml(
+            dir.path(),
+            "agentproc:\n  command: echo\n  args: [\"ok\"]\ntransport: foobar-unknown\n",
+        );
+        let app = BridgeApp::load(&cfg).unwrap();
+        let cli = Cli::parse_from([
+            "im-agentproc",
+            "--hub-url",
+            "http://127.0.0.1:8765",
+            "--allow-null-transport",
+        ]);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let t = rt
+            .block_on(build_transport(&app, &cli, &cfg, None, true))
+            .expect("NullTransport placeholder should build");
+        // NullTransport advertises default capabilities (no media_upload).
+        let caps = t.capabilities();
+        assert!(!caps.media_upload);
+    }
+
+    #[test]
+    fn build_transport_telegram_falls_back_to_env_token() {
+        // No im_credentials.token in YAML, but TELEGRAM_BOT_TOKEN in env → must
+        // construct successfully. TelegramTransport::new is purely local
+        // (no network), so this stays hermetic.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_im_credential_env();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = write_yaml(
+            dir.path(),
+            "agentproc:\n  command: echo\n  args: [\"ok\"]\ntransport: telegram\n",
+        );
+        let app = BridgeApp::load(&cfg).unwrap();
+        let cli = Cli::parse_from(["im-agentproc", "--hub-url", "http://127.0.0.1:8765"]);
+        // SAFETY: held under ENV_LOCK.
+        unsafe {
+            std::env::set_var("TELEGRAM_BOT_TOKEN", "test-token-only");
+        }
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(build_transport(&app, &cli, &cfg, None, true));
+        // SAFETY: still under ENV_LOCK; _guard drops at end of fn.
+        unsafe {
+            std::env::remove_var("TELEGRAM_BOT_TOKEN");
+        }
+        let t = result.expect("TelegramTransport should build from env var");
+        let caps = t.capabilities();
+        assert!(
+            caps.media_upload,
+            "Telegram transport reports media_upload=true (send_media implemented)"
         );
     }
 }
