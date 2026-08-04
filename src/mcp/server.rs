@@ -17,11 +17,11 @@ use std::io::{self, BufRead, Write};
 use std::sync::Arc;
 
 use anyhow::Result;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{json, Value};
 use tracing::{debug, warn};
 
-use super::tools::{ToolHandler, ToolRegistry};
+use super::tools::ToolRegistry;
 
 /// JSON-RPC protocol version string we advertise. MCP 2025-06-18 sets
 /// `2025-06-18`; the actual wire shape matches the current spec's `Tools`
@@ -212,6 +212,9 @@ pub(crate) fn success_empty() -> Value {
     json!({ "content": [], "isError": false })
 }
 
+/// 带 text 的 silent success（与 failure_text 配对）。当前生产成功路径用
+/// 空 content（`content:[]`），此函数为测试与未来"成功带说明"场景预留。
+#[allow(dead_code)]
 pub(crate) fn success_text(text: impl Into<String>) -> Value {
     json!({
         "content": [{"type": "text", "text": text.into()}],
@@ -239,11 +242,14 @@ mod tests {
 
     /// A fake `Transport` whose `send_reply` / `send_media` records what was
     /// passed so tests can assert on the call.
+    /// 测试辅助 transport（send_reply/send_media 记录入参供断言）。
+    #[allow(dead_code)]
     struct CapturingTransport {
         last_text: Arc<Mutex<Option<String>>>,
         last_media: Arc<Mutex<Option<MediaRef>>>,
     }
 
+    #[allow(dead_code)]
     impl CapturingTransport {
         fn new() -> Self {
             Self {

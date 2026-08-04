@@ -72,6 +72,9 @@ struct PhotoSize {
     file_size: Option<u64>,
 }
 
+// Telegram Bot API 响应 DTO。字段与 API 返回形状对齐（部分字段当前未被读取，
+// 保留以保持反序列化容错——Telegram 可能返回，后续功能会用到）。
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct Document {
     file_id: String,
@@ -80,6 +83,7 @@ struct Document {
     file_size: Option<u64>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct Audio {
     file_id: String,
@@ -88,6 +92,7 @@ struct Audio {
     file_size: Option<u64>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct Video {
     file_id: String,
@@ -95,6 +100,7 @@ struct Video {
     file_size: Option<u64>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct Voice {
     file_id: String,
@@ -102,6 +108,7 @@ struct Voice {
     file_size: Option<u64>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct Chat {
     id: i64,
@@ -112,6 +119,7 @@ struct Chat {
     first_name: Option<String>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct User {
     id: i64,
@@ -400,7 +408,7 @@ impl Transport for TelegramTransport {
             // Advance the offset past the highest update_id we've seen.
             if let InboundOutcome::Messages(ref msgs) = outcome {
                 for msg in msgs {
-                    if let Some(ref extra) = msg.extra.get("update_id") {
+                    if let Some(extra) = msg.extra.get("update_id") {
                         if let Some(uid) = extra.as_i64() {
                             let next = uid + 1;
                             let cur: i64 = buf.trim().parse().unwrap_or(0);
@@ -531,7 +539,7 @@ mod send_media_e2e_tests {
     fn png_media(filename: &str) -> MediaRef {
         MediaRef {
             kind: "image".into(),
-            url: format!("data:image/png;base64,iVBORw0KGgo="), // 8-byte stub PNG
+            url: "data:image/png;base64,iVBORw0KGgo=".into(), // 8-byte stub PNG
             filename: Some(filename.into()),
             mime_type: Some("image/png".into()),
             size: Some(8),
@@ -539,7 +547,7 @@ mod send_media_e2e_tests {
     }
 
     #[tokio::test]
-    async fn send_media_image_routes_to_sendPhoto_multipart() {
+    async fn send_media_image_routes_to_send_photo_multipart() {
         let mut server = mockito::Server::new_async().await;
         let m = server
             .mock("POST", "/bot123:abc/sendPhoto")
@@ -568,7 +576,7 @@ mod send_media_e2e_tests {
     }
 
     #[tokio::test]
-    async fn send_media_throttled_returns_Throttled_outcome() {
+    async fn send_media_throttled_returns_throttled_outcome() {
         let mut server = mockito::Server::new_async().await;
         let m = server
             .mock("POST", "/bot123:abc/sendDocument")

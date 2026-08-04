@@ -463,6 +463,6 @@ mod mcp_extra_env_tests {
             Some("cli_y")
         );
         // unset vars do not appear
-        assert!(out.get("IM_AGENTPROC_MCP_TELEGRAM_TOKEN").is_none());
+        assert!(!out.contains_key("IM_AGENTPROC_MCP_TELEGRAM_TOKEN"));
     }
 }

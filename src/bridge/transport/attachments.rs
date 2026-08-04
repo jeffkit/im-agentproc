@@ -123,6 +123,10 @@ pub fn normalize_attachment_without_cwd(
 ///   warning + `None` return so the caller skips the attachment. Relative
 ///   `file://` paths are resolved against `cwd`.
 /// - `filename` / `mime_type` / `size` are passed through unchanged.
+///
+/// 预留 API：当前 transport（iLink）用 `normalize_attachment_without_cwd`；
+/// 带 cwd 的版本留给后续需要解析相对路径的 adapter（Telegram/WeCom 等）。
+#[allow(dead_code)]
 pub fn normalize_attachment(
     raw_kind: &str,
     raw_url: &str,
@@ -204,6 +208,8 @@ pub fn normalize_attachment(
 }
 
 /// Convenience wrapper for a list of `(kind, url, ...)` tuples.
+/// 预留 API（与 normalize_attachment 配套，供后续 adapter 使用）。
+#[allow(dead_code)]
 pub fn normalize_attachments<I>(items: I, cwd: &Path) -> Vec<MediaRef>
 where
     I: IntoIterator<Item = (String, String, Option<String>, Option<String>, Option<u64>)>,
@@ -243,6 +249,8 @@ impl NormalizedAttachment {
 /// Helper: assert `cwd` exists when callers want to resolve relative paths.
 /// Adapters that already run inside a process with a known cwd can ignore
 /// the result; the function exists to keep the call sites explicit.
+/// 预留 API（与 normalize_attachment 配套）。
+#[allow(dead_code)]
 pub fn require_cwd(cwd: &Path) -> Result<&Path> {
     if cwd.as_os_str().is_empty() {
         Err(anyhow!(

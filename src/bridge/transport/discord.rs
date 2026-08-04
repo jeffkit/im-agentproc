@@ -628,6 +628,8 @@ impl Transport for DiscordTransport {
                 .part("files[0]", part);
             let resp = http
                 .post(format!("{}/channels/{channel_id}/messages", self.api_base))
+                .bearer_auth(bot_token)
+                .multipart(form)
                 .send()
                 .await
                 .context("Discord sendMedia HTTP")?;
@@ -791,7 +793,7 @@ mod send_media_e2e_tests {
     }
 
     #[tokio::test]
-    async fn send_media_throttled_returns_Throttled_outcome() {
+    async fn send_media_throttled_returns_throttled_outcome() {
         let mut server = mockito::Server::new_async().await;
         let m = server
             .mock("POST", "/channels/C123/messages")

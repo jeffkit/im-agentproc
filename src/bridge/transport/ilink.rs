@@ -76,6 +76,8 @@ pub struct HubClient {
 }
 
 impl HubClient {
+    /// 生产入口（与 `with_hub_base` 等价，后者是测试/自定义 base 用）。
+    #[allow(dead_code)]
     pub(crate) fn new(hub_url: String, token: String) -> Result<Self> {
         Self::with_hub_base(hub_url, token)
     }

@@ -179,10 +179,8 @@ pub async fn read_media_bytes(http: &reqwest::Client, media: &MediaRef) -> Resul
 pub fn filename_from_url(url: &str) -> Option<String> {
     let scheme_sep = url.find("://")?;
     let after_scheme = &url[scheme_sep + 3..];
-    let (host, path) = match after_scheme.find('/') {
-        Some(i) => (&after_scheme[..i], &after_scheme[i..]),
-        None => return None,
-    };
+    let slash = after_scheme.find('/')?;
+    let (host, path) = (&after_scheme[..slash], &after_scheme[slash..]);
     let path = path.split('?').next().unwrap_or(path);
     let tail = path.rsplit('/').next().unwrap_or("");
     if tail.is_empty() || tail == host {

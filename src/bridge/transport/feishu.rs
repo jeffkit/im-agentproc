@@ -660,7 +660,7 @@ mod send_media_e2e_tests {
     }
 
     #[tokio::test]
-    async fn send_media_throttled_returns_Throttled_outcome() {
+    async fn send_media_throttled_returns_throttled_outcome() {
         let mut server = mockito::Server::new_async().await;
         let _ = server
             .mock("POST", "/auth/v3/tenant_access_token/internal")

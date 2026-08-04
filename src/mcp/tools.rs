@@ -19,9 +19,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use crate::bridge::transport::{
-    MediaOut, MediaRef, OutboundReply, SendOutcome, Transport, TransportCapabilities,
-};
+use crate::bridge::transport::{MediaOut, MediaRef, OutboundReply, SendOutcome, Transport};
 
 /// Tool descriptor — surfaced via `tools/list`. The `input_schema` is a
 /// JSON Schema object per the MCP 2025-06-18 spec.
