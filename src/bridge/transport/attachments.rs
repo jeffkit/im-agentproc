@@ -281,16 +281,50 @@ mod tests {
     }
 
     #[test]
+    fn parse_kind_all_five_legal_values() {
+        // ACC-01: the five controlled-vocabulary strings each map to their
+        // own variant.
+        assert_eq!(AttachmentKind::parse("image"), AttachmentKind::Image);
+        assert_eq!(AttachmentKind::parse("file"), AttachmentKind::File);
+        assert_eq!(AttachmentKind::parse("audio"), AttachmentKind::Audio);
+        assert_eq!(AttachmentKind::parse("video"), AttachmentKind::Video);
+        assert_eq!(AttachmentKind::parse("other"), AttachmentKind::Other);
+    }
+
+    #[test]
+    fn parse_kind_synonyms() {
+        // ACC-02: synonyms collapse onto the canonical kind.
+        for s in ["photo", "picture", "img"] {
+            assert_eq!(AttachmentKind::parse(s), AttachmentKind::Image, "{s}");
+        }
+        for s in ["document", "doc", "attachment"] {
+            assert_eq!(AttachmentKind::parse(s), AttachmentKind::File, "{s}");
+        }
+        assert_eq!(AttachmentKind::parse("voice"), AttachmentKind::Audio);
+    }
+
+    #[test]
     fn parse_kind_unknown_falls_back_to_other() {
-        assert_eq!(AttachmentKind::parse("gibberish"), AttachmentKind::Other);
+        // ACC-03: anything outside the controlled vocabulary (including the
+        // empty string) falls to Other — parse never panics, never fails.
+        for s in ["gibberish", "unknown", "foo", "", "   ", "image-file"] {
+            assert_eq!(AttachmentKind::parse(s), AttachmentKind::Other, "{s:?}");
+        }
     }
 
     #[test]
     fn normalize_drops_disallowed_scheme() {
-        // ftp:// is not in ALLOWED_SCHEMES — the attachment is dropped.
-        let out =
-            normalize_attachment("image", "ftp://example.com/x.png", None, None, None, &cwd());
-        assert!(out.is_none(), "ftp:// must be dropped: {out:?}");
+        // ACC-06: schemes outside ALLOWED_SCHEMES (file/http/https/data) are
+        // dropped — ftp:// and javascript: must never reach the agent.
+        for url in [
+            "ftp://example.com/x.png",
+            "javascript:alert(1)",
+            "ws://example.com/x",
+            "gopher://example.com/x",
+        ] {
+            let out = normalize_attachment("image", url, None, None, None, &cwd());
+            assert!(out.is_none(), "{url} must be dropped: {out:?}");
+        }
     }
 
     #[test]
@@ -359,6 +393,23 @@ mod tests {
     }
 
     #[test]
+    fn normalize_without_cwd_unknown_kind_keeps_other() {
+        // ACC-04 on the primary transport path (iLink build_media calls
+        // normalize_attachment_without_cwd): an out-of-vocabulary kind is
+        // preserved as kind=other, not dropped.
+        let out = normalize_attachment_without_cwd(
+            "sticker",
+            "https://example.com/s.webp",
+            None,
+            None,
+            None,
+        )
+        .expect("kind=other is still kept without cwd");
+        assert_eq!(out.kind, AttachmentKind::Other);
+        assert_eq!(out.url, "https://example.com/s.webp");
+    }
+
+    #[test]
     fn normalize_resolves_relative_file_path_against_cwd() {
         // url crate semantics for `file://`: the URL is parsed as
         // `scheme://host/path`, where `file://hello.txt` means
@@ -401,6 +452,58 @@ mod tests {
             none.is_none(),
             "non-existent file:// attachment should be dropped"
         );
+    }
+
+    #[test]
+    fn normalize_absolute_file_url_canonicalizes_to_same_file() {
+        // ACC-07: an absolute file:// URL survives canonicalisation and the
+        // normalised URL still resolves to the *same* file.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("target.bin");
+        std::fs::write(&file, b"data").unwrap();
+
+        let url = Url::from_file_path(&file).unwrap().to_string();
+        assert!(url.starts_with("file://"), "precondition: {url}");
+
+        let out = normalize_attachment("file", &url, None, None, None, dir.path())
+            .expect("existing absolute file:// URL is kept");
+        assert!(out.url.starts_with("file://"), "stays absolute: {}", out.url);
+
+        let back = Url::parse(&out.url)
+            .expect("normalised url parses")
+            .to_file_path()
+            .expect("normalised file url decodes to a path");
+        assert_eq!(
+            back,
+            file.canonicalize().unwrap(),
+            "normalised url must resolve to the canonicalised target"
+        );
+    }
+
+    #[test]
+    fn normalize_relative_file_form_is_dropped() {
+        // ACC-08: url::Url on Unix cannot express a *relative* path through a
+        // file:// URL — `file://rel.txt` parses as host=`rel.txt`, path=`/`,
+        // so `Url::to_file_path()` returns Err and the attachment is dropped.
+        // The cwd.join(相对路径) branch in normalize_attachment is therefore
+        // unreachable through file:// URLs and is intentionally not exercised
+        // here; production code is left untouched.
+        let out = normalize_attachment("file", "file://rel.txt", None, None, None, &cwd());
+        assert!(out.is_none(), "host-style file:// must be dropped: {out:?}");
+    }
+
+    #[test]
+    fn normalize_drops_missing_file_url() {
+        // ACC-09: a file:// URL whose target does not exist fails
+        // canonicalize and is dropped (warn-and-drop), so adapters never
+        // forward an unreachable file URL to the agent.
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist.txt");
+        assert!(!missing.exists(), "precondition: target must not exist");
+
+        let url = Url::from_file_path(&missing).unwrap().to_string();
+        let out = normalize_attachment("file", &url, None, None, None, dir.path());
+        assert!(out.is_none(), "missing file:// attachment must be dropped: {out:?}");
     }
 
     #[test]
