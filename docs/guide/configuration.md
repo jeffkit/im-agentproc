@@ -7,9 +7,10 @@ A bridge profile is **one YAML file == one agentproc profile**, in spec-aligned 
 ```yaml
 description: issue-keeper on MiniMax          # surfaced via the Hub MCP list_agents tool
 script: ./my-handler.py                       # optional shorthand (expanded to command/args)
-transport: ilink                              # default; only ilink is implemented today
-via: hub                                      # default; or `direct` to skip the Hub
+transport: ilink                              # ilink | telegram | wecom | feishu | discord
+via: hub                                      # default; or `direct` to skip the Hub (ilink only)
 base_url: https://ilinkai.weixin.qq.com       # only used by `via: direct`
+im_credentials: {}                            # transport-specific; ${VAR} expanded at load time
 agentproc:
   executor: claude-code                       # optional in-process executor
   command: python3                             # argv[0] — single token, never split
@@ -37,8 +38,9 @@ agentproc:
 |-------|---------|-------------|
 | `description` | — | Human-readable agent description. Surfaced via the Hub MCP `list_agents` tool so other agents can discover this backend's capability. |
 | `script` | — | Shorthand: a script path expanded into `command`/`args` by extension. An explicit `agentproc.command` always wins. |
-| `transport` | `ilink` | IM protocol. Only `ilink` is implemented; any other string loads a `NullTransport` placeholder (needs `--allow-null-transport`). |
-| `via` | `hub` | Credential/connection mode. `hub` resolves a virtual token via the Hub; `direct` connects to the real iLink upstream. |
+| `transport` | `ilink` | IM protocol. Supported values: `ilink`, `telegram`, `wecom`, `feishu`, `discord`. Any unrecognised string loads a `NullTransport` placeholder (needs `--allow-null-transport`). |
+| `im_credentials` | `{}` | IM-transport-specific credentials. Values support `${VAR}` environment-variable expansion at load time. Required keys vary by transport — see the [IM platform guides](/guide/telegram). |
+| `via` | `hub` | Credential/connection mode (`ilink` only). `hub` resolves a virtual token via the Hub; `direct` connects to the real iLink upstream. |
 | `base_url` | — | Real iLink upstream URL for `via: direct` (e.g. `https://ilinkai.weixin.qq.com`). Overrides `--hub-url`/`WEIXIN_BASE_URL` for this profile. Ignored when `via: hub`. |
 | `agentproc` | — | The pure agentproc profile block (see below). |
 

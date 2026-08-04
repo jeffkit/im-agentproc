@@ -34,12 +34,28 @@ export default defineConfig({
             ],
           },
           {
+            text: 'IM 接入指南',
+            items: [
+              { text: 'Telegram', link: '/zh/guide/telegram' },
+              { text: '企业微信 (WeCom)', link: '/zh/guide/wecom' },
+              { text: '飞书 (Feishu)', link: '/zh/guide/feishu' },
+              { text: 'Discord', link: '/zh/guide/discord' },
+              { text: '通过 MCP 出站投递', link: '/zh/guide/mcp-outbound' },
+            ],
+          },
+          {
             text: '参考',
             items: [
               { text: 'CLI 参考', link: '/zh/cli' },
               { text: 'Bridge 运行模式', link: '/zh/bridge/' },
               { text: '内置 Profile 规范', link: '/zh/bridge/profile-spec' },
               { text: 'Transport 扩展', link: '/zh/transport' },
+            ],
+          },
+          {
+            text: 'AI Agent Skills',
+            items: [
+              { text: 'Skills 总览', link: '/zh/skills' },
             ],
           },
         ],
@@ -65,6 +81,16 @@ export default defineConfig({
             { text: 'What is IM-AgentProc?', link: '/guide/what-is-im-agentproc' },
             { text: 'Quick Start', link: '/guide/quickstart' },
             { text: 'Configuration', link: '/guide/configuration' },
+          ],
+        },
+        {
+          text: 'IM Platform Guides',
+          items: [
+            { text: 'Telegram', link: '/guide/telegram' },
+            { text: 'WeCom', link: '/guide/wecom' },
+            { text: 'Feishu (Lark)', link: '/guide/feishu' },
+            { text: 'Discord', link: '/guide/discord' },
+            { text: 'Outbound delivery via MCP', link: '/guide/mcp-outbound' },
           ],
         },
       ],

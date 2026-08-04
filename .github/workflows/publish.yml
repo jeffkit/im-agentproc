@@ -1,0 +1,58 @@
+name: Publish to crates.io
+
+# Publishes `im-agentproc` to crates.io when a maintainer pushes a semver
+# tag (e.g. `v0.2.0`). The version in `Cargo.toml` must already be bumped
+# before tagging — this workflow does not mutate the manifest.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Cargo.lock is the source of truth for reproducible builds; ensure the
+# workflow checks it in even for crates that don't currently publish a
+# binary (the lib + the bin/im-agentproc both use it).
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Verify the workspace compiles clean
+        # Catch obvious breakage before asking crates.io to host it.
+        run: cargo check --all-targets
+
+      - name: Run the full test suite
+        run: cargo test --all-targets
+
+      - name: Dry-run publish to surface warnings
+        # `cargo publish --dry-run` builds the crate as if for upload and
+        # fails on missing metadata / broken doc-links. Surfaces problems
+        # before we burn the real publish token.
+        run: cargo publish --dry-run --allow-dirty
+
+      - name: Publish to crates.io
+        # The CRATES_TOKEN secret is provisioned at
+        # https://github.com/jeffkit/im-agentproc/settings/secrets/actions.
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_TOKEN }}
+        run: cargo publish
