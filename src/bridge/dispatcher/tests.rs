@@ -1,3 +1,4 @@
+use super::handle::handle_one_message;
 use super::{
     backoff_for, backoff_for_test, run_partial_forward_loop, sanitize_errmsg,
     send_final_with_retry, session_dispatch_key, BridgeStop, SessionDispatcher, MAX_BACKOFF_SECS,
@@ -1297,4 +1298,20 @@ async fn partial_persistent_throttle_gives_up_then_serves_new_chunk() {
         total > after_giveup,
         "a fresh chunk after give-up must trigger new send attempts ({total} !> {after_giveup})"
     );
+}
+
+/// Reproduce the full production message path (handle_one_message → executor →
+/// on_partial → reply) INSIDE a tokio runtime, so any `block_on`/block_in_place
+/// call from within the runtime surfaces with a clean, non-interleaved backtrace.
+#[tokio::test]
+async fn repro_e2e_codebuddy_block_on() {
+    std::env::set_var("CODEBUDDY_MODEL", "glm-5.1-ioa");
+    let app = BridgeApp::parse_yaml(
+        "agentproc:\n  executor: codebuddy\n  timeout_secs: 60\n  streaming: true\n",
+        "cb".to_string(),
+    )
+    .unwrap();
+    let client: Arc<dyn Transport> = Arc::new(ScriptedSender::new_loop(SendOutcome::Sent));
+    let msg = make_msg("ctx-repro-1", "default");
+    let _ = handle_one_message(&client, &app, msg, CancellationToken::new()).await;
 }

@@ -95,6 +95,14 @@ impl<'de> Deserialize<'de> for Via {
 ///     ANTHROPIC_API_KEY: ${MINIMAX_API_KEY}
 ///     CLAUDE_MODEL: MiniMax-M3
 /// ```
+///
+/// For non-iLink transports, supply credentials under `im_credentials:`:
+///
+/// ```yaml
+/// transport: telegram
+/// im_credentials:
+///   token: ${TELEGRAM_BOT_TOKEN}
+/// ```
 #[derive(Debug, Deserialize)]
 pub struct BridgeProfileFile {
     /// Agent description (surfaced via the Hub MCP `list_agents` tool).
@@ -129,6 +137,18 @@ pub struct BridgeProfileFile {
     /// direct profiles against different upstreams. Ignored when `via: hub`.
     #[serde(default)]
     pub base_url: Option<String>,
+
+    /// IM-transport-specific credentials. Values support `${VAR}` expansion
+    /// against the process environment at config load time.
+    ///
+    /// | transport   | required keys                 |
+    /// |-------------|-------------------------------|
+    /// | `telegram`  | `token`                       |
+    /// | `wecom`     | `bot_id`, `bot_secret`        |
+    /// | `feishu`    | `app_id`, `app_secret`        |
+    /// | `discord`   | `token`                       |
+    #[serde(default)]
+    pub im_credentials: HashMap<String, String>,
 }
 
 /// The `agentproc:` block — field-for-field the agentproc profile spec
@@ -295,6 +315,8 @@ pub struct BridgeApp {
     transport: TransportKind,
     via: Via,
     direct_base_url: Option<String>,
+    /// IM-transport-specific credentials (env-expanded at load time).
+    im_credentials: HashMap<String, String>,
 }
 
 impl BridgeApp {
@@ -357,12 +379,27 @@ impl BridgeApp {
         }
         reject_shell_injection_risk(&profile, &name)?;
 
+        // Expand ${VAR} in im_credentials values against the process environment.
+        let process_env: HashMap<String, String> = std::env::vars().collect();
+        let mut im_credentials = HashMap::new();
+        for (k, v) in &file.im_credentials {
+            let expanded = expand_env_var_named(
+                v,
+                &process_env,
+                Some(&name),
+                Some(&format!("im_credentials.{k}")),
+            )
+            .with_context(|| format!("expanding im_credentials.{k}"))?;
+            im_credentials.insert(k.clone(), expanded);
+        }
+
         Ok(Self {
             name,
             profile,
             transport: file.transport,
             via: file.via,
             direct_base_url: file.base_url,
+            im_credentials,
         })
     }
 
@@ -411,6 +448,13 @@ impl BridgeApp {
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
+    }
+
+    /// IM-transport-specific credentials (env-expanded at load time).
+    /// Keys and their meanings are transport-specific — see the YAML docstring
+    /// on `BridgeProfileFile.im_credentials`.
+    pub fn im_credentials(&self) -> &HashMap<String, String> {
+        &self.im_credentials
     }
 }
 

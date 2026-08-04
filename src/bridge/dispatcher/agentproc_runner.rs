@@ -97,6 +97,7 @@ pub(super) async fn run_via_agentproc(
     from_user: &str,
     attachments: &[ApAttachment],
     partial_tx: watch::Sender<Option<String>>,
+    mcp_extra_env: std::collections::HashMap<String, String>,
 ) -> Result<(String, Option<String>, RunSummary)> {
     let ap_profile = to_agentproc_profile(profile);
 
@@ -154,7 +155,7 @@ pub(super) async fn run_via_agentproc(
         profile_dir: None,
         timeout_secs: Some(profile.timeout_secs),
         streaming: Some(profile.streaming),
-        extra_env: std::collections::HashMap::new(),
+        extra_env: mcp_extra_env,
         attachments: attachments.to_vec(),
         on_partial: Some(on_partial),
         on_session: None,
@@ -206,6 +207,59 @@ pub(super) async fn run_via_agentproc(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn repro_codebuddy_panic() {
+        let mut env = std::collections::HashMap::new();
+        env.insert("CODEBUDDY_MODEL".to_string(), "glm-5.1-ioa".to_string());
+        let bp = BridgeProfile {
+            command: String::new(),
+            args: vec![],
+            timeout_secs: 60,
+            streaming: true,
+            executor: Some("codebuddy".into()),
+            env,
+            ..Default::default()
+        };
+        let (partial_tx, _partial_rx) = tokio::sync::watch::channel::<Option<String>>(None);
+        let _ = run_via_agentproc(
+            &bp,
+            "test",
+            "ping",
+            "",
+            "default",
+            "user",
+            &[],
+            partial_tx,
+            Default::default(),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn repro_echo_panic() {
+        let bp = BridgeProfile {
+            command: "echo".into(),
+            args: vec!["hello".into()],
+            timeout_secs: 30,
+            streaming: true,
+            executor: None,
+            ..Default::default()
+        };
+        let (partial_tx, _partial_rx) = tokio::sync::watch::channel::<Option<String>>(None);
+        let _ = run_via_agentproc(
+            &bp,
+            "test",
+            "hello",
+            "",
+            "default",
+            "user",
+            &[],
+            partial_tx,
+            Default::default(),
+        )
+        .await;
+    }
 
     #[test]
     fn to_agentproc_profile_preserves_fields() {

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -159,6 +160,7 @@ pub(super) async fn handle_one_message(
         &from_user,
         &ap_attachments,
         partial_tx,
+        mcp_extra_env_for_profile(profile),
     )
     .await;
 
@@ -352,5 +354,115 @@ fn log_message_handled_success(
             duration_ms = summary.duration_ms,
             "message handled: a2a final reply"
         );
+    }
+}
+
+/// Collect `IM_AGENTPROC_MCP_*` env vars from the bridge process environment
+/// so they can be forwarded to the hub profile child via
+/// [`agentproc::RunOptions::extra_env`].
+///
+/// Today the hub profile child is responsible for spawning its own
+/// `im-agentproc mcp-server` subprocess (see
+/// `docs/guide/mcp-outbound.md`); the bridge just forwards the env so the
+/// child sees the same transport + context that the bridge did. Future
+/// revisions may move the spawn inside the bridge itself and pass stdio
+/// pipes via `_STDOUT_FD` / `_STDIN_FD` keys — see the inline notes in
+/// `agentproc_runner.rs`.
+fn mcp_extra_env_for_profile(
+    _profile: &crate::bridge::config::BridgeProfile,
+) -> HashMap<String, String> {
+    let keys = [
+        "IM_AGENTPROC_MCP_AUTOSTART",
+        "IM_AGENTPROC_MCP_TRANSPORT",
+        "IM_AGENTPROC_MCP_CONTEXT_TOKEN",
+        "IM_AGENTPROC_MCP_TO_USER",
+        "IM_AGENTPROC_MCP_TELEGRAM_TOKEN",
+        "IM_AGENTPROC_MCP_FEISHU_APP_ID",
+        "IM_AGENTPROC_MCP_FEISHU_APP_SECRET",
+        "IM_AGENTPROC_MCP_WECOM_BOT_ID",
+        "IM_AGENTPROC_MCP_WECOM_BOT_SECRET",
+        "IM_AGENTPROC_MCP_DISCORD_TOKEN",
+        "IM_AGENTPROC_MCP_ILINK_HUB_URL",
+        "IM_AGENTPROC_MCP_ILINK_TOKEN",
+    ];
+    let mut out = HashMap::new();
+    for k in keys {
+        if let Ok(v) = std::env::var(k) {
+            if !v.trim().is_empty() {
+                out.insert(k.to_string(), v);
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod mcp_extra_env_tests {
+    use super::*;
+
+    // Process-env reads/writes are not thread-safe; serialise via a global
+    // mutex so concurrent test runs don't race.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Wipe every `IM_AGENTPROC_MCP_*` env var the helper looks at, so
+    /// the empty-env test isn't polluted by other tests setting one.
+    fn clear_mcp_env() {
+        let keys = [
+            "IM_AGENTPROC_MCP_AUTOSTART",
+            "IM_AGENTPROC_MCP_TRANSPORT",
+            "IM_AGENTPROC_MCP_CONTEXT_TOKEN",
+            "IM_AGENTPROC_MCP_TO_USER",
+            "IM_AGENTPROC_MCP_TELEGRAM_TOKEN",
+            "IM_AGENTPROC_MCP_FEISHU_APP_ID",
+            "IM_AGENTPROC_MCP_FEISHU_APP_SECRET",
+            "IM_AGENTPROC_MCP_WECOM_BOT_ID",
+            "IM_AGENTPROC_MCP_WECOM_BOT_SECRET",
+            "IM_AGENTPROC_MCP_DISCORD_TOKEN",
+            "IM_AGENTPROC_MCP_ILINK_HUB_URL",
+            "IM_AGENTPROC_MCP_ILINK_TOKEN",
+        ];
+        // SAFETY: serialised by ENV_LOCK.
+        for k in keys {
+            unsafe {
+                std::env::remove_var(k);
+            }
+        }
+    }
+
+    #[test]
+    fn empty_env_produces_empty_map() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_mcp_env();
+        assert!(mcp_extra_env_for_profile(&Default::default()).is_empty());
+    }
+
+    #[test]
+    fn set_vars_propagate() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_mcp_env();
+        // SAFETY: serialised by ENV_LOCK.
+        unsafe {
+            std::env::set_var("IM_AGENTPROC_MCP_TRANSPORT", "feishu");
+            std::env::set_var("IM_AGENTPROC_MCP_CONTEXT_TOKEN", "oc_x");
+            std::env::set_var("IM_AGENTPROC_MCP_FEISHU_APP_ID", "cli_y");
+        }
+        let out = mcp_extra_env_for_profile(&Default::default());
+        clear_mcp_env();
+        assert_eq!(
+            out.get("IM_AGENTPROC_MCP_TRANSPORT").map(String::as_str),
+            Some("feishu")
+        );
+        assert_eq!(
+            out.get("IM_AGENTPROC_MCP_CONTEXT_TOKEN")
+                .map(String::as_str),
+            Some("oc_x")
+        );
+        assert_eq!(
+            out.get("IM_AGENTPROC_MCP_FEISHU_APP_ID")
+                .map(String::as_str),
+            Some("cli_y")
+        );
+        // unset vars do not appear
+        assert!(out.get("IM_AGENTPROC_MCP_TELEGRAM_TOKEN").is_none());
     }
 }

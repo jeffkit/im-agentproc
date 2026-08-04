@@ -12,6 +12,7 @@ pub mod bridge;
 pub mod client;
 pub mod error;
 pub mod ilink;
+pub mod mcp;
 pub mod paths;
 
 pub use error::HubError;

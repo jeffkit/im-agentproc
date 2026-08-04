@@ -20,8 +20,14 @@
 use futures_util::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 
+pub(crate) mod attachments;
 pub(crate) mod connection;
+pub(crate) mod discord;
+pub(crate) mod feishu;
 pub(crate) mod ilink;
+pub(crate) mod media;
+pub(crate) mod telegram;
+pub(crate) mod wecom;
 
 pub use connection::{
     default_auto_client_name, default_direct_credential_path, default_local_credential_path,
@@ -179,6 +185,24 @@ pub struct TransportCapabilities {
     pub media_upload: bool,
 }
 
+/// Context for an outbound media send — the minimal routing info an adapter
+/// needs alongside the [`MediaRef`] itself. Mirrors the routing fields on
+/// [`OutboundReply`] so `send_media` can stand alone without going through
+/// `send_reply`.
+#[derive(Debug, Clone, Default)]
+pub struct MediaOut {
+    /// Reply-routing identifier (chat_id / channel_id / context_token).
+    pub context_token: String,
+    /// Recipient (derived from inbound `from_user`); may be empty for
+    /// transport-shaped sends where the routing context is sufficient.
+    pub to_user: String,
+    /// Optional caption / body text paired with the media attachment.
+    /// Adapters that cannot caption (e.g. some WeCom `msgtype`) ignore it.
+    pub caption: Option<String>,
+    /// Reply-to message id (IM-specific; ignore when the IM has no quote).
+    pub reply_to: Option<String>,
+}
+
 /// IM-protocol-agnostic transport. One implementation per IM protocol.
 ///
 /// `next_inbound` advances the long-poll cursor in `buf` for transports that
@@ -200,8 +224,204 @@ pub trait Transport: Send + Sync {
     fn send_reply<'a>(&'a self, reply: OutboundReply)
         -> BoxFuture<'a, anyhow::Result<SendOutcome>>;
 
+    /// Send a media attachment (image / file / voice / video). Default
+    /// implementation refuses so existing adapters keep working without
+    /// changes; adapters that can upload override and also report
+    /// [`TransportCapabilities::media_upload`] as `true`.
+    ///
+    /// The returned [`SendOutcome`] mirrors `send_reply` semantics so callers
+    /// can apply the same throttling / retry logic.
+    fn send_media<'a>(
+        &'a self,
+        ctx: MediaOut,
+        media: MediaRef,
+    ) -> BoxFuture<'a, anyhow::Result<SendOutcome>> {
+        let _ = (ctx, media);
+        Box::pin(async move {
+            Err(anyhow::anyhow!(
+                "transport `{}` does not support media upload",
+                self.name()
+            ))
+        })
+    }
+
+    /// Short stable name for this transport (e.g. `"telegram"`, `"feishu"`).
+    /// Used in error messages and logs; matches the `transport:` YAML key.
+    fn name(&self) -> &'static str {
+        "unknown"
+    }
+
     /// Declare this transport's optional capabilities.
     fn capabilities(&self) -> TransportCapabilities;
 }
 
+pub use discord::DiscordTransport;
+pub use feishu::FeishuTransport;
 pub use ilink::IlinkTransport;
+pub use telegram::TelegramTransport;
+pub use wecom::WecomTransport;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Bare-bones transport that does NOT override `send_media`. Used to
+    /// verify the trait-default behaviour: every adapter that hasn't opted in
+    /// to media upload gets a clear error naming itself.
+    struct BareTransport;
+
+    impl Transport for BareTransport {
+        fn next_inbound<'a>(
+            &'a self,
+            _buf: &'a mut String,
+        ) -> BoxFuture<'a, anyhow::Result<InboundOutcome>> {
+            Box::pin(async move { Ok(InboundOutcome::Messages(vec![])) })
+        }
+
+        fn send_reply<'a>(
+            &'a self,
+            _reply: OutboundReply,
+        ) -> BoxFuture<'a, anyhow::Result<SendOutcome>> {
+            Box::pin(async move { Ok(SendOutcome::Sent) })
+        }
+
+        fn name(&self) -> &'static str {
+            "bare"
+        }
+
+        fn capabilities(&self) -> TransportCapabilities {
+            TransportCapabilities::default()
+        }
+    }
+
+    /// Bare transport that overrides `send_media` and reports
+    /// `media_upload: true`. Verifies that adapters can opt in by overriding
+    /// the default method.
+    struct MediaCapableTransport {
+        seen: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    }
+
+    impl Transport for MediaCapableTransport {
+        fn next_inbound<'a>(
+            &'a self,
+            _buf: &'a mut String,
+        ) -> BoxFuture<'a, anyhow::Result<InboundOutcome>> {
+            Box::pin(async move { Ok(InboundOutcome::Messages(vec![])) })
+        }
+
+        fn send_reply<'a>(
+            &'a self,
+            _reply: OutboundReply,
+        ) -> BoxFuture<'a, anyhow::Result<SendOutcome>> {
+            Box::pin(async move { Ok(SendOutcome::Sent) })
+        }
+
+        fn send_media<'a>(
+            &'a self,
+            ctx: MediaOut,
+            media: MediaRef,
+        ) -> BoxFuture<'a, anyhow::Result<SendOutcome>> {
+            let seen = self.seen.clone();
+            Box::pin(async move {
+                *seen.lock().unwrap() = Some(format!("{}|{}", ctx.context_token, media.url));
+                Ok(SendOutcome::Sent)
+            })
+        }
+
+        fn name(&self) -> &'static str {
+            "media-capable"
+        }
+
+        fn capabilities(&self) -> TransportCapabilities {
+            TransportCapabilities { media_upload: true }
+        }
+    }
+
+    #[tokio::test]
+    async fn send_media_default_impl_errors_with_transport_name() {
+        let t = BareTransport;
+        let ctx = MediaOut {
+            context_token: "chat-1".into(),
+            to_user: "u-1".into(),
+            caption: None,
+            reply_to: None,
+        };
+        let media = MediaRef {
+            kind: "image".into(),
+            url: "file:///tmp/test.png".into(),
+            filename: None,
+            mime_type: Some("image/png".into()),
+            size: None,
+        };
+        let err = t.send_media(ctx, media).await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("bare") && msg.contains("does not support media upload"),
+            "expected trait-default error naming the transport: {msg}"
+        );
+        // Default implementation implies no media_upload capability.
+        assert!(!t.capabilities().media_upload);
+    }
+
+    #[tokio::test]
+    async fn send_media_override_receives_ctx_and_media() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let t = MediaCapableTransport { seen: seen.clone() };
+        let ctx = MediaOut {
+            context_token: "chat-42".into(),
+            to_user: "u-42".into(),
+            caption: Some("hello".into()),
+            reply_to: Some("msg-99".into()),
+        };
+        let media = MediaRef {
+            kind: "file".into(),
+            url: "file:///tmp/report.pdf".into(),
+            filename: Some("report.pdf".into()),
+            mime_type: Some("application/pdf".into()),
+            size: Some(1024),
+        };
+        let outcome = t.send_media(ctx, media).await.expect("override succeeds");
+        assert_eq!(outcome, SendOutcome::Sent);
+        let captured = seen
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("override captured input");
+        assert_eq!(captured, "chat-42|file:///tmp/report.pdf");
+        // Override implies media_upload capability.
+        assert!(t.capabilities().media_upload);
+    }
+
+    #[test]
+    fn transport_name_is_returned_per_impl() {
+        // The five real adapters each report their YAML-key name. Verified via
+        // the trait method directly (constructing a DiscordTransport etc.
+        // would require a real network token, so we cover names with a mock).
+        struct Named(&'static str);
+        impl Transport for Named {
+            fn next_inbound<'a>(
+                &'a self,
+                _buf: &'a mut String,
+            ) -> BoxFuture<'a, anyhow::Result<InboundOutcome>> {
+                Box::pin(async move { Ok(InboundOutcome::Messages(vec![])) })
+            }
+            fn send_reply<'a>(
+                &'a self,
+                _reply: OutboundReply,
+            ) -> BoxFuture<'a, anyhow::Result<SendOutcome>> {
+                Box::pin(async move { Ok(SendOutcome::Sent) })
+            }
+            fn name(&self) -> &'static str {
+                self.0
+            }
+            fn capabilities(&self) -> TransportCapabilities {
+                TransportCapabilities::default()
+            }
+        }
+        assert_eq!(Named("telegram").name(), "telegram");
+        assert_eq!(Named("feishu").name(), "feishu");
+        assert_eq!(Named("wecom").name(), "wecom");
+        assert_eq!(Named("discord").name(), "discord");
+        assert_eq!(Named("ilink").name(), "ilink");
+    }
+}

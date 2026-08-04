@@ -4,7 +4,7 @@
 //! Used by the `im-agentproc` binary; see `docs/bridge/index.md`.
 
 pub mod builtin;
-mod config;
+pub mod config;
 pub(crate) mod dispatcher;
 mod executor;
 pub mod manager;
@@ -14,7 +14,7 @@ pub mod protocol;
 pub mod transport;
 pub mod vtoken_env;
 
-pub use config::{BridgeApp, BridgeProfile, TransportKind, Via};
+pub use config::{BridgeApp, BridgeProfile, BridgeProfileFile, TransportKind, Via};
 pub use dispatcher::{run_bridge, run_bridge_with_shutdown, BridgeStop};
 pub use executor::MAX_CLI_CAPTURE_BYTES;
 pub use paths::resolve_bridge_executable;

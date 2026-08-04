@@ -18,12 +18,12 @@ use tracing::warn;
 
 use super::connection::hub_response_token_rejected;
 use crate::bridge::transport::{
-    InboundMessage, InboundOutcome, MediaRef, OutboundReply, SendOutcome, Transport,
+    InboundMessage, InboundOutcome, MediaOut, MediaRef, OutboundReply, SendOutcome, Transport,
     TransportCapabilities,
 };
 use crate::ilink::types::{
-    msg_type, BaseInfo, GetUpdatesRequest, GetUpdatesResponse, HubExt, SendMessageRequest,
-    SendMessageResponse, WeixinMessage,
+    msg_type, BaseInfo, GetUpdatesRequest, GetUpdatesResponse, GetUploadUrlRequest,
+    GetUploadUrlResponse, HubExt, SendMessageRequest, SendMessageResponse, WeixinMessage,
 };
 
 pub(crate) enum GetUpdatesOutcome {
@@ -60,8 +60,16 @@ pub(crate) fn parse_sendoutcome(text: &str) -> Result<SendOutcome, (i32, Option<
     }
 }
 
+/// Compute a lowercase hex MD5 digest of `bytes`. iLink's `getuploadurl`
+/// takes a `file_md5` field for the upstream to verify the upload against
+/// the bytes the caller is about to PUT.
+fn md5_hex(bytes: &[u8]) -> String {
+    let digest = md5::compute(bytes);
+    format!("{:x}", digest)
+}
+
 #[derive(Clone)]
-pub(crate) struct HubClient {
+pub struct HubClient {
     http: reqwest::Client,
     hub_url: String,
     token: String,
@@ -69,6 +77,15 @@ pub(crate) struct HubClient {
 
 impl HubClient {
     pub(crate) fn new(hub_url: String, token: String) -> Result<Self> {
+        Self::with_hub_base(hub_url, token)
+    }
+
+    /// Construct with an explicit `hub_base`. Tests use this to point the
+    /// client at a local mockito server; production code should call
+    /// [`Self::new`]. The supplied `hub_url` is normalised (trailing
+    /// `/` stripped) so the same path-building code works for both real
+    /// and test setups.
+    pub(crate) fn with_hub_base(hub_url: String, token: String) -> Result<Self> {
         let hub_url = hub_url.trim_end_matches('/').to_string();
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(15))
@@ -163,6 +180,58 @@ impl HubClient {
             }
         }
     }
+
+    /// Step 1 of the iLink media upload flow: ask the upstream for a one-shot
+    /// upload URL + `media_id`. The caller PUTs the bytes to `upload_url`
+    /// and then references `media_id` in a `sendmessage` request.
+    pub(crate) async fn getuploadurl(
+        &self,
+        req: GetUploadUrlRequest,
+    ) -> Result<GetUploadUrlResponse> {
+        let url = format!("{}/ilink/bot/getuploadurl", self.hub_url);
+        let resp = self
+            .http
+            .post(url)
+            .header("Authorization", format!("Bearer {}", self.token.trim()))
+            .json(&req)
+            .send()
+            .await
+            .context("getuploadurl HTTP")?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("getuploadurl HTTP {status}: {body}");
+        }
+        resp.json::<GetUploadUrlResponse>()
+            .await
+            .context("getuploadurl JSON")
+    }
+
+    /// Step 2 of the iLink media upload flow: PUT raw bytes to the
+    /// one-shot URL the upstream returned from `getuploadurl`. The `Content-Type`
+    /// header should match the file's MIME type; iLink uses this to decide
+    /// between image / file / voice / video on the receiving side.
+    pub(crate) async fn upload_to(
+        &self,
+        upload_url: &str,
+        bytes: Vec<u8>,
+        mime_type: Option<&str>,
+    ) -> Result<()> {
+        let mut req = self.http.put(upload_url).body(bytes);
+        if let Some(m) = mime_type {
+            req = req.header(reqwest::header::CONTENT_TYPE, m);
+        }
+        let resp = req
+            .send()
+            .await
+            .with_context(|| format!("upload PUT {upload_url}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("upload PUT HTTP {status}: {body}");
+        }
+        Ok(())
+    }
 }
 
 /// Build generic [`MediaRef`]s from an iLink message's media items.
@@ -183,13 +252,11 @@ fn build_media(msg: &WeixinMessage) -> Vec<MediaRef> {
                     .and_then(|i| i.cdn_url.as_deref())
                     .filter(|s| !s.is_empty())
                 {
-                    out.push(MediaRef {
-                        kind: "image".into(),
-                        url: url.to_string(),
-                        filename: None,
-                        mime_type: None,
-                        size: None,
-                    });
+                    if let Some(n) = super::attachments::normalize_attachment_without_cwd(
+                        "image", url, None, None, None,
+                    ) {
+                        out.push(n.into_media_ref());
+                    }
                 }
                 break;
             }
@@ -201,13 +268,15 @@ fn build_media(msg: &WeixinMessage) -> Vec<MediaRef> {
                         .map(|url| (url, fi.file_name.as_deref()))
                 });
                 if let Some((url, fname)) = file_meta {
-                    out.push(MediaRef {
-                        kind: "file".into(),
-                        url: url.to_string(),
-                        filename: fname.map(|s| s.to_string()),
-                        mime_type: None,
-                        size: None,
-                    });
+                    if let Some(n) = super::attachments::normalize_attachment_without_cwd(
+                        "file",
+                        url,
+                        fname.map(|s| s.to_string()),
+                        None,
+                        None,
+                    ) {
+                        out.push(n.into_media_ref());
+                    }
                 }
                 break;
             }
@@ -218,13 +287,11 @@ fn build_media(msg: &WeixinMessage) -> Vec<MediaRef> {
                     .and_then(|v| v.cdn_url.as_deref())
                     .filter(|s| !s.is_empty())
                 {
-                    out.push(MediaRef {
-                        kind: "video".into(),
-                        url: url.to_string(),
-                        filename: None,
-                        mime_type: None,
-                        size: None,
-                    });
+                    if let Some(n) = super::attachments::normalize_attachment_without_cwd(
+                        "video", url, None, None, None,
+                    ) {
+                        out.push(n.into_media_ref());
+                    }
                 }
                 break;
             }
@@ -292,7 +359,8 @@ fn outbound_to_sendmessage(reply: OutboundReply) -> SendMessageRequest {
     req
 }
 
-/// iLink transport: wraps a [`HubClient`] and speaks the generic [`Transport`]
+/// iLink transport: wraps `HubClient` (defined in `crate::ilink::types`)
+/// and speaks the generic `Transport` trait.
 /// trait. This is the adapter the dispatcher consumes; it hides
 /// `crate::ilink::types` from the rest of the bridge.
 #[derive(Clone)]
@@ -302,8 +370,15 @@ pub struct IlinkTransport {
 
 impl IlinkTransport {
     pub fn new(hub_url: String, token: String) -> Result<Self> {
+        Self::with_hub_base(hub_url, token)
+    }
+
+    /// Construct with an explicit `hub_base` (default for production is
+    /// whatever the bridge manager passes; tests point this at a mockito
+    /// server).
+    pub fn with_hub_base(hub_url: String, token: String) -> Result<Self> {
         Ok(Self {
-            client: HubClient::new(hub_url, token)?,
+            client: HubClient::with_hub_base(hub_url, token)?,
         })
     }
 }
@@ -331,14 +406,136 @@ impl Transport for IlinkTransport {
         Box::pin(async move { self.client.sendmessage(req).await })
     }
 
+    fn name(&self) -> &'static str {
+        "ilink"
+    }
+
+    fn send_media<'a>(
+        &'a self,
+        ctx: MediaOut,
+        media: MediaRef,
+    ) -> BoxFuture<'a, Result<SendOutcome>> {
+        Box::pin(async move {
+            // 1. Read bytes from the URI scheme.
+            let bytes = super::media::read_media_bytes(
+                // The iLink transport doesn't carry its own `reqwest::Client`
+                // field; HubClient owns the only one. We rebuild a tiny
+                // read-only client for `http(s)://` fetches — the heavier
+                // `media_upload` flow reuses HubClient for upload.
+                &reqwest::Client::builder()
+                    .connect_timeout(Duration::from_secs(15))
+                    .timeout(Duration::from_secs(60))
+                    .build()
+                    .context("build read client for iLink media")?,
+                &media,
+            )
+            .await?;
+
+            // 2. Step 1 of the iLink upload flow: ask the upstream for a
+            // one-shot upload URL + `media_id`.
+            let file_type = match media.kind.as_str() {
+                "image" => "image",
+                "audio" | "voice" => "voice",
+                "video" => "video",
+                _ => "file",
+            };
+            let file_size = media.size.unwrap_or(bytes.len() as u64);
+            let file_md5 = md5_hex(&bytes);
+            let upload_req = GetUploadUrlRequest {
+                file_type: file_type.to_string(),
+                file_size,
+                file_md5: Some(file_md5),
+            };
+            let upload_resp = self.client.getuploadurl(upload_req).await?;
+            if upload_resp.ret != 0 {
+                anyhow::bail!(
+                    "iLink getuploadurl ret={} errmsg={:?}",
+                    upload_resp.ret,
+                    upload_resp.errmsg
+                );
+            }
+            let upload_url = upload_resp
+                .upload_url
+                .ok_or_else(|| anyhow::anyhow!("iLink getuploadurl returned no upload_url"))?;
+            let media_id = upload_resp
+                .media_id
+                .ok_or_else(|| anyhow::anyhow!("iLink getuploadurl returned no media_id"))?;
+
+            // 3. Step 2: PUT the bytes to the one-shot URL.
+            self.client
+                .upload_to(&upload_url, bytes, media.mime_type.as_deref())
+                .await?;
+
+            // 4. Step 3: send the reply referencing media_id. iLink routes
+            // the right slot by `msgtype`: image → image_item.media_id,
+            // everything else → file_item.media_id.
+            let req = match media.kind.as_str() {
+                "image" => {
+                    let mut msg =
+                        WeixinMessage::build_image_reply(ctx.context_token.clone(), media_id);
+                    if !ctx.to_user.is_empty() {
+                        msg.to_user_id = Some(ctx.to_user.clone());
+                    }
+                    SendMessageRequest {
+                        msg: Some(msg),
+                        base_info: Some(BaseInfo::default()),
+                    }
+                }
+                _ => {
+                    let filename = media
+                        .filename
+                        .clone()
+                        .or_else(|| super::media::filename_from_url(&media.url))
+                        .unwrap_or_else(|| "attachment".into());
+                    let mut msg = WeixinMessage::build_file_reply(
+                        ctx.context_token.clone(),
+                        media_id,
+                        Some(filename),
+                    );
+                    if !ctx.to_user.is_empty() {
+                        msg.to_user_id = Some(ctx.to_user.clone());
+                    }
+                    SendMessageRequest {
+                        msg: Some(msg),
+                        base_info: Some(BaseInfo::default()),
+                    }
+                }
+            };
+            self.client.sendmessage(req).await
+        })
+    }
+
     fn capabilities(&self) -> TransportCapabilities {
-        TransportCapabilities::default()
+        TransportCapabilities { media_upload: true }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn md5_hex_produces_lowercase_32_char_digest() {
+        // The iLink upstream's `file_md5` field is documented as
+        // lower-case hex of the MD5 of the file bytes. We lock down the
+        // format here so a future Rust upgrade doesn't silently switch
+        // to upper-case or a different hex format.
+        let digest = md5_hex(b"hello");
+        assert_eq!(digest.len(), 32);
+        assert!(digest
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert_eq!(digest, "5d41402abc4b2a76b9719d911017c592");
+    }
+
+    #[test]
+    fn capabilities_reports_media_upload_true() {
+        // Smoke-only: the helper construction requires a valid base url but
+        // no network call. The assertion is on the trait method, which
+        // must stay true now that the upload flow lands.
+        let t = IlinkTransport::new("http://127.0.0.1:1".into(), "t".into()).unwrap();
+        assert!(t.capabilities().media_upload);
+    }
 
     #[test]
     fn parse_sendoutcome_three_categories() {
@@ -368,5 +565,257 @@ mod tests {
 
         // unparseable non-empty body → Sent (legacy fallback)
         assert_eq!(parse_sendoutcome("not json").unwrap(), SendOutcome::Sent);
+    }
+
+    // ── e2e: send_media three-step upload flow ────────────────────────────
+
+    fn transport_for(hub_base: String) -> IlinkTransport {
+        IlinkTransport::with_hub_base(hub_base, "test-token".into()).expect("test transport")
+    }
+
+    fn png_payload() -> MediaRef {
+        MediaRef {
+            kind: "image".into(),
+            url: "data:image/png;base64,iVBORw0KGgo=".into(),
+            filename: Some("plot.png".into()),
+            mime_type: Some("image/png".into()),
+            size: Some(8),
+        }
+    }
+
+    #[tokio::test]
+    async fn send_media_image_walks_getuploadurl_put_and_sendmessage() {
+        let mut server = mockito::Server::new_async().await;
+        // Step 1: getuploadurl returns a one-shot URL under the same mock
+        // server so mockito can match the subsequent PUT.
+        let upload_url = format!("{}/upload-test", server.url());
+        let m_get = server
+            .mock("POST", "/ilink/bot/getuploadurl")
+            .match_header("Authorization", "Bearer test-token")
+            .with_status(200)
+            .with_body(format!(
+                r#"{{"ret":0,"upload_url":"{upload_url}","media_id":"mid-1","errmsg":""}}"#
+            ))
+            .create_async()
+            .await;
+        // Step 2: PUT bytes to the one-shot URL.
+        let m_put = server
+            .mock("PUT", "/upload-test")
+            .with_status(200)
+            .with_body("")
+            .create_async()
+            .await;
+        // Step 3: sendmessage references media_id. iLink's sendmessage
+        // returns an empty body on success, which parse_sendoutcome treats
+        // as `Sent` (legacy fallback).
+        let m_send = server
+            .mock("POST", "/ilink/bot/sendmessage")
+            .match_header("Authorization", "Bearer test-token")
+            .with_status(200)
+            .with_body("")
+            .create_async()
+            .await;
+
+        let t = transport_for(server.url());
+        let ctx = MediaOut {
+            context_token: "ctx".into(),
+            to_user: String::new(),
+            caption: None,
+            reply_to: None,
+        };
+        let outcome = t
+            .send_media(ctx, png_payload())
+            .await
+            .expect("iLink send_media ok");
+        assert_eq!(outcome, SendOutcome::Sent);
+        m_get.assert_async().await;
+        m_put.assert_async().await;
+        m_send.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn send_media_getuploadurl_non_zero_ret_bails() {
+        let mut server = mockito::Server::new_async().await;
+        let m_get = server
+            .mock("POST", "/ilink/bot/getuploadurl")
+            .with_status(200)
+            .with_body(r#"{"ret":-1,"upload_url":"","media_id":"","errmsg":"quota"}"#)
+            .create_async()
+            .await;
+        let t = transport_for(server.url());
+        let ctx = MediaOut {
+            context_token: "ctx".into(),
+            to_user: String::new(),
+            caption: None,
+            reply_to: None,
+        };
+        let err = t.send_media(ctx, png_payload()).await.unwrap_err();
+        assert!(format!("{err:#}").contains("quota"));
+        m_get.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn send_media_upload_put_5xx_bubbles_up_as_err() {
+        let mut server = mockito::Server::new_async().await;
+        let _ = server
+            .mock("POST", "/ilink/bot/getuploadurl")
+            .with_status(200)
+            .with_body(format!(
+                r#"{{"ret":0,"upload_url":"{}/upload-test","media_id":"mid-2","errmsg":""}}"#,
+                server.url()
+            ))
+            .create_async()
+            .await;
+        let m_put = server
+            .mock("PUT", "/upload-test")
+            .with_status(500)
+            .with_body("internal error")
+            .create_async()
+            .await;
+        let t = transport_for(server.url());
+        let ctx = MediaOut {
+            context_token: "ctx".into(),
+            to_user: String::new(),
+            caption: None,
+            reply_to: None,
+        };
+        let err = t.send_media(ctx, png_payload()).await.unwrap_err();
+        assert!(format!("{err:#}").contains("HTTP 500"));
+        m_put.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn send_media_file_kind_routes_to_file_item_with_filename() {
+        let mut server = mockito::Server::new_async().await;
+        let upload_url = format!("{}/upload-test", server.url());
+        let _ = server
+            .mock("POST", "/ilink/bot/getuploadurl")
+            .with_status(200)
+            .with_body(format!(
+                r#"{{"ret":0,"upload_url":"{upload_url}","media_id":"mid-3","errmsg":""}}"#
+            ))
+            .create_async()
+            .await;
+        let _ = server
+            .mock("PUT", "/upload-test")
+            .with_status(200)
+            .with_body("")
+            .create_async()
+            .await;
+        // Step 3: sendmessage with file_item instead of image_item. iLink
+        // uses the same /sendmessage endpoint for both; the diff is in the
+        // message body the bridge sends. We don't body-match here — the
+        // success of the round trip is sufficient evidence.
+        let _ = server
+            .mock("POST", "/ilink/bot/sendmessage")
+            .with_status(200)
+            .with_body("")
+            .create_async()
+            .await;
+
+        let t = transport_for(server.url());
+        let ctx = MediaOut {
+            context_token: "ctx".into(),
+            to_user: String::new(),
+            caption: None,
+            reply_to: None,
+        };
+        let media = MediaRef {
+            kind: "file".into(),
+            url: "data:application/pdf;base64,JVBERi0=".into(),
+            filename: Some("report.pdf".into()),
+            mime_type: Some("application/pdf".into()),
+            size: Some(8),
+        };
+        let outcome = t.send_media(ctx, media).await.expect("file kind ok");
+        assert_eq!(outcome, SendOutcome::Sent);
+    }
+
+    // ── e2e: next_inbound poll round trip ────────────────────────────────
+
+    #[tokio::test]
+    async fn next_inbound_polls_getupdates_and_decodes_text_reply() {
+        let mut server = mockito::Server::new_async().await;
+        // The bridge calls /ilink/bot/getupdates with `get_updates_buf`
+        // carrying the cursor; we ignore body matching here (cursor may be
+        // empty on first poll) and reply with a single text message from
+        // the user. iLink treats `ret != 0` as soft-failure (warn, return
+        // empty) — keep `ret: 0`.
+        let m = server
+            .mock("POST", "/ilink/bot/getupdates")
+            .match_header("Authorization", "Bearer test-token")
+            .with_status(200)
+            .with_body(
+                r#"{
+                    "ret": 0,
+                    "msgs": [{
+                        "context_token": "ctx-abc",
+                        "message_type": 1,
+                        "from_user_id": "user-xyz",
+                        "message_state": 1,
+                        "item_list": [{
+                            "item_type": 101,
+                            "text_item": {"text": "hi from user"}
+                        }],
+                        "ilink_hub_ext": {"session_id": "sess-1", "session_name": "default"}
+                    }]
+                }"#,
+            )
+            .create_async()
+            .await;
+
+        let t = transport_for(server.url());
+        let mut buf = String::new();
+        let outcome = t.next_inbound(&mut buf).await.expect("next_inbound ok");
+        match outcome {
+            InboundOutcome::Messages(msgs) => {
+                assert_eq!(msgs.len(), 1);
+                let m = &msgs[0];
+                assert_eq!(m.context_token.as_deref(), Some("ctx-abc"));
+                assert_eq!(m.from_user.as_deref(), Some("user-xyz"));
+                assert_eq!(m.text.as_deref(), Some("hi from user"));
+                assert_eq!(m.session_id.as_deref(), Some("sess-1"));
+                assert_eq!(m.session_name.as_deref(), Some("default"));
+                assert!(!m.is_from_bot);
+            }
+            InboundOutcome::TokenRejected => panic!("expected Messages, got TokenRejected"),
+        }
+        m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn next_inbound_returns_empty_when_server_returns_no_msgs() {
+        let mut server = mockito::Server::new_async().await;
+        let m = server
+            .mock("POST", "/ilink/bot/getupdates")
+            .with_status(200)
+            .with_body(r#"{"ret":0,"msgs":[]}"#)
+            .create_async()
+            .await;
+
+        let t = transport_for(server.url());
+        let mut buf = String::new();
+        let outcome = t.next_inbound(&mut buf).await.expect("ok");
+        match outcome {
+            InboundOutcome::Messages(msgs) => assert!(msgs.is_empty()),
+            InboundOutcome::TokenRejected => panic!("expected empty Messages"),
+        }
+        m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn next_inbound_returns_token_rejected_on_401() {
+        let mut server = mockito::Server::new_async().await;
+        let _ = server
+            .mock("POST", "/ilink/bot/getupdates")
+            .with_status(401)
+            .with_body(r#"{"ret":-14,"errcode":401,"errmsg":"token expired"}"#)
+            .create_async()
+            .await;
+
+        let t = transport_for(server.url());
+        let mut buf = String::new();
+        let outcome = t.next_inbound(&mut buf).await.expect("ok");
+        assert!(matches!(outcome, InboundOutcome::TokenRejected));
     }
 }

@@ -57,7 +57,7 @@ impl LoginClient {
         self.login_with_qr_ui(None).await
     }
 
-    /// Same as [`login_with_qr`], but can push QR + status to `ui` (e.g. a desktop window).
+    /// Same as [`Self::login_with_qr`], but can push QR + status to `ui` (e.g. a desktop window).
     pub async fn login_with_qr_ui(
         &self,
         ui: Option<UnboundedSender<QrLoginUiEvent>>,

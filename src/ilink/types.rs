@@ -261,7 +261,7 @@ impl WeixinMessage {
 
     /// Return true if the message contains at least one non-text media item (image / voice / file / video).
     ///
-    /// Unlike [`has_content`], this returns `false` for a text-only item_list even when the text
+    /// Unlike [`Self::has_content`], this returns `false` for a text-only item_list even when the text
     /// is empty. Used by the sendmessage handler to distinguish session-persist-only messages
     /// (empty TextItem) from real media replies that have no text but do carry content.
     pub fn has_media_content(&self) -> bool {
