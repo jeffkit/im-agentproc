@@ -2,3 +2,8 @@
 .env
 *.credentials.json
 .DS_Store
+
+# flowcast pge runtime artifacts (keep gates.json/agents.json/hygiene.md tracked)
+.flowcast/runs/
+.flowcast/pge/
+.flowcast/dryrun/
