@@ -159,6 +159,27 @@ let t = reg.build(&ctx).await?;
 
 A new IM channel therefore ships as an independent unit: implement `Transport`, `register(kind, factory)` — no edits to `src/bin/im-agentproc.rs` or `TransportKind` (which stays an open string wrapper, not a closed enum).
 
+### Shipping a downstream binary (library run entry)
+
+The default bridge run — profile probe → transport build → long-poll → reconnect-on-revocation → Ctrl-C/SIGTERM — lives in the library as `bridge::run_loop::run_bridge_reconnecting(BridgeRunOptions)`. A downstream crate ships a thin `main` that registers its factories and delegates:
+
+```rust,ignore
+let mut registry = TransportRegistry::with_builtins();
+registry.register("rocketchat", |ctx| { /* build your adapter from ctx */ });
+run_bridge_reconnecting(BridgeRunOptions {
+    registry,
+    app: BridgeApp::load(&config_path)?,
+    hub_url: cli.hub_url.clone(),
+    /* ...plain-value options, no CLI types... */
+}).await
+```
+
+A complete compilable example lives in [`examples/custom_transport_main.rs`](../examples/custom_transport_main.rs). The shipped `im-agentproc` binary uses the exact same entry with `with_builtins()`.
+
+### MCP outbound subprocess
+
+The `im-agentproc mcp-server` subprocess resolves its transport through `TransportRegistry::with_mcp_builtins()` as well (no separate `match`). Credential env vars follow the uniform `IM_AGENTPROC_MCP_{KIND}_{KEY}` scheme — `{KEY}` is lowercased into `im_credentials` (e.g. `IM_AGENTPROC_MCP_TELEGRAM_TOKEN` → `token`, `IM_AGENTPROC_MCP_FEISHU_APP_SECRET` → `app_secret`), then each adapter's `from_credentials` constructs it. Custom kinds registered in the MCP registry resolve here too.
+
 ## Push / webhook inbound pattern
 
 `next_inbound` is a pull API, but push-driven IMs (webhook / event callbacks) are still first-class. The blessed adapter pattern keeps the dispatcher unchanged:

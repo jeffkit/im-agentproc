@@ -20,6 +20,16 @@ Versions follow [Semantic Versioning](https://semver.org/).
   `--allow-null-transport` (L4); the direct-mode M2 guard is unchanged.
 - **Push/webhook adapter pattern** documented in `docs/transport.md`
   (adapter-hosted receiver → internal buffer → `next_inbound` drain).
+- **Library run entry for downstream channels.** The default bridge run moved
+  from the binary into the library (`bridge::run_loop::run_bridge_reconnecting(BridgeRunOptions)`),
+  with the transport registry supplied by the caller — a downstream crate can
+  ship a thin `main` registering custom `transport:` kinds with zero edits to
+  this repository. See `examples/custom_transport_main.rs`.
+- **MCP subprocess via the registry.** `im-agentproc mcp-server` resolves its
+  transport through `TransportRegistry::with_mcp_builtins()` (hardcoded `match`
+  removed). Credential env vars follow the uniform
+  `IM_AGENTPROC_MCP_{KIND}_{KEY}` scheme (`{KEY}` lowercased into
+  `im_credentials`); custom kinds registered in the MCP registry resolve too.
 
 ## [0.2.0] - 2026-07-27
 

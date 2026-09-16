@@ -16,23 +16,18 @@
 //!
 //! 配置见 `docs/bridge/index.md`，内置 profile 规范见 `docs/bridge/profile-spec.md`。
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use tracing::{info, warn};
+use tracing::info;
 
-use std::io::IsTerminal;
 
-use anyhow::Context;
 use im_agentproc::bridge::transport::registry::{TransportBuildCtx, TransportRegistry};
-use im_agentproc::bridge::transport::{
-    DiscordTransport, FeishuTransport, IlinkTransport, TelegramTransport, Transport, WecomTransport,
-};
+use im_agentproc::bridge::transport::Transport;
 use im_agentproc::bridge::{
-    builtin, default_direct_credential_path, default_local_credential_path,
-    run_bridge_with_shutdown, BridgeApp, BridgeStop, Via,
+    builtin, BridgeApp, Via,
 };
 use im_agentproc::mcp::{
     run_server, OutboundDelivery, SendFileTool, SendImageTool, SendTextTool, SendVoiceTool,
@@ -167,20 +162,6 @@ enum Commands {
     },
 }
 
-/// Resolves on SIGTERM on Unix; never resolves on other platforms.
-/// Lets us use SIGTERM in `tokio::select!` without `#[cfg]` inside the macro.
-async fn make_sigterm_future() {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{signal, SignalKind};
-        if let Ok(mut s) = signal(SignalKind::terminate()) {
-            s.recv().await;
-            return;
-        }
-    }
-    std::future::pending::<()>().await;
-}
-
 fn explicit_token(cli: &Cli) -> Option<&str> {
     cli.token
         .as_deref()
@@ -212,7 +193,7 @@ async fn run_mcp_server() -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("IM_AGENTPROC_MCP_CONTEXT_TOKEN is required"))?;
     let to_user = std::env::var("IM_AGENTPROC_MCP_TO_USER").unwrap_or_default();
 
-    let transport = resolve_mcp_transport(&transport_name)?;
+    let transport = resolve_mcp_transport(&transport_name).await?;
 
     let delivery = Arc::new(OutboundDelivery::new(transport, context_token, to_user));
     let mut registry = ToolRegistry::default();
@@ -235,82 +216,46 @@ async fn run_mcp_server() -> Result<()> {
 /// env vars. Credentials are pulled from env so the manager doesn't have to
 /// leak them through argv (which is visible in `ps(1)`).
 ///
-/// Synchronous so unit tests can call it without spinning up a Tokio runtime.
-fn resolve_mcp_transport(transport_name: &str) -> Result<Arc<dyn Transport>> {
-    use std::sync::Arc;
-    let env_var = |key: &str| -> Result<String> {
-        std::env::var(key)
-            .ok()
-            .filter(|s| !s.trim().is_empty())
-            .ok_or_else(|| anyhow::anyhow!("{key} is required"))
-    };
-    let transport: Arc<dyn Transport> = match transport_name {
-        "telegram" => Arc::new(TelegramTransport::new(env_var(
-            "IM_AGENTPROC_MCP_TELEGRAM_TOKEN",
-        )?)?),
-        "feishu" => Arc::new(FeishuTransport::new(
-            env_var("IM_AGENTPROC_MCP_FEISHU_APP_ID")?,
-            env_var("IM_AGENTPROC_MCP_FEISHU_APP_SECRET")?,
-        )?),
-        "wecom" => Arc::new(WecomTransport::new(
-            env_var("IM_AGENTPROC_MCP_WECOM_BOT_ID")?,
-            env_var("IM_AGENTPROC_MCP_WECOM_BOT_SECRET")?,
-        )),
-        "discord" => Arc::new(DiscordTransport::new(env_var(
-            "IM_AGENTPROC_MCP_DISCORD_TOKEN",
-        )?)?),
-        "ilink" => Arc::new(IlinkTransport::new(
-            env_var("IM_AGENTPROC_MCP_ILINK_HUB_URL")?,
-            env_var("IM_AGENTPROC_MCP_ILINK_TOKEN")?,
-        )?),
-        other => anyhow::bail!(
-            "unknown transport `{other}` for mcp-server; expected ilink/telegram/wecom/feishu/discord"
-        ),
-    };
-    Ok(transport)
-}
-
-/// Build the configured transport for the bridge run.
+/// Credential keys follow the uniform `IM_AGENTPROC_MCP_{KIND}_{KEY}` scheme
+/// (`{KEY}` lowercased into `im_credentials`, e.g. `IM_AGENTPROC_MCP_TELEGRAM_TOKEN`
+/// → `token`); construction goes through the MCP registry
+/// ([`TransportRegistry::with_mcp_builtins`]), so custom kinds registered
+/// downstream resolve here too.
 ///
-/// Transport selection goes through the pluggable registry
-/// ([`TransportRegistry::with_builtins`]): each `transport:` kind resolves to a
-/// registered factory (ilink hub/direct, telegram, wecom, feishu, discord; each
-/// adapter owns its credential parsing), and an unknown kind fails fast unless
-/// `--allow-null-transport` opts into the `NullTransport` placeholder (L4).
-/// New IM channels register a factory instead of editing this function — see
-/// `docs/transport.md`.
-async fn build_transport(
-    app: &BridgeApp,
-    cli: &Cli,
-    config_path: &Path,
-    description: Option<&str>,
-    interactive: bool,
-) -> Result<Arc<dyn Transport>> {
-    let registry = TransportRegistry::with_builtins();
+/// Async (factories are async); unit tests drive it via `#[tokio::test]`.
+async fn resolve_mcp_transport(transport_name: &str) -> Result<Arc<dyn Transport>> {
+    use std::collections::HashMap;
+
+    let prefix = format!("IM_AGENTPROC_MCP_{}_", transport_name.to_ascii_uppercase());
+    let creds: HashMap<String, String> = std::env::vars()
+        .filter(|(k, v)| k.starts_with(&prefix) && !v.trim().is_empty())
+        .map(|(k, v)| (k[prefix.len()..].to_ascii_lowercase(), v))
+        .collect();
+
+    let registry = TransportRegistry::with_mcp_builtins();
+    if registry.get(transport_name).is_none() {
+        anyhow::bail!(
+            "unknown transport `{transport_name}` for mcp-server; expected {}",
+            registry.kinds().join("/")
+        );
+    }
     let ctx = TransportBuildCtx {
-        kind: app.transport().as_str().to_string(),
-        via: app.via(),
-        hub_url: cli.hub_url.clone(),
-        direct_base_url: app.direct_base_url().map(str::to_string),
-        im_credentials: app.im_credentials().clone(),
-        explicit_token: explicit_token(cli).map(str::to_string),
-        cred_file: cli.cred_file.clone(),
-        force_pair: cli.pair,
-        force_register: cli.force_register,
-        register_name: cli.register_name.clone(),
-        config_path: Some(config_path.to_path_buf()),
-        description: description.map(str::to_string),
-        interactive,
-        allow_null_placeholder: cli.allow_null_transport,
+        kind: transport_name.to_string(),
+        via: Via::Hub,
+        hub_url: String::new(),
+        direct_base_url: None,
+        im_credentials: creds,
+        explicit_token: None,
+        cred_file: None,
+        force_pair: false,
+        force_register: false,
+        register_name: None,
+        config_path: None,
+        description: None,
+        interactive: false,
+        allow_null_placeholder: false,
     };
-    let t = registry.build(&ctx).await?;
-    let caps = t.capabilities();
-    info!(
-        transport = ctx.kind.as_str(),
-        media_upload = caps.media_upload,
-        "transport built"
-    );
-    Ok(t)
+    registry.build(&ctx).await
 }
 
 #[tokio::main]
@@ -400,6 +345,9 @@ async fn main() -> Result<()> {
         }
         None => {
             // Default mode: connect to Hub and long-poll for messages.
+            // Transport selection goes through the (overridable) registry; a
+            // downstream crate can ship its own thin main registering custom
+            // factories and delegating to bridge::run_loop — see docs/transport.md.
             let config_path = cli
                 .config
                 .clone()
@@ -407,132 +355,22 @@ async fn main() -> Result<()> {
             let app = BridgeApp::load(&config_path)?;
             info!(config_path = %config_path.display(), "loaded bridge config");
 
-            // Startup probe to verify that the CLI command(s) exist and are usable.
-            for name in app.profile_names() {
-                if let Some(profile) = app.profile(name) {
-                    if let Err(e) = im_agentproc::bridge::probe_profile_light(profile) {
-                        eprintln!("Startup probe failed for profile `{}`: {}", name, e);
-                        std::process::exit(1);
-                    }
-                }
-            }
-
-            let cred_path = cli
-                .cred_file
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| match app.via() {
-                    Via::Direct => default_direct_credential_path(),
-                    Via::Hub => default_local_credential_path(),
-                });
-            let using_explicit_token = explicit_token(&cli).is_some();
-
-            // Interactive flows (QR login) require a TTY for stdout and must not
-            // be disabled via --no-interactive / ILINKHUB_BRIDGE_NON_INTERACTIVE
-            // (the manager injects the latter so its children fail fast instead
-            // of QR-blocking headless — review N1).
-            let interactive = !cli.no_interactive && std::io::stdout().is_terminal();
-
-            // Shared shutdown token — cancelled by Ctrl-C or SIGTERM so that
-            // in-flight AI calls are gracefully cancelled and users are notified.
-            let shutdown = tokio_util::sync::CancellationToken::new();
-
-            // Build a SIGTERM future once, outside the reconnect loop.
-            // On non-Unix platforms this never resolves (pending forever).
-            let sigterm_fut = make_sigterm_future();
-            tokio::pin!(sigterm_fut);
-
-            'reconnect: loop {
-                // Get description from default profile for registration
-                let description = app
-                    .profile(app.default_profile_name())
-                    .and_then(|p| p.description.as_deref());
-
-                let transport =
-                    build_transport(&app, &cli, &config_path, description, interactive).await?;
-
-                let mut handle = tokio::spawn(run_bridge_with_shutdown(
-                    transport,
-                    app.clone(),
-                    shutdown.clone(),
-                ));
-
-                tokio::select! {
-                    _ = tokio::signal::ctrl_c() => {
-                        info!("bridge received Ctrl-C; shutting down gracefully");
-                        shutdown.cancel();
-                        // Wait up to 3 s for error replies to be sent before aborting.
-                        // Only abort+await when the task did NOT finish within the timeout;
-                        // re-awaiting an already-completed JoinHandle causes a panic.
-                        let timed_out = tokio::time::timeout(
-                            std::time::Duration::from_secs(3),
-                            &mut handle,
-                        ).await.is_err();
-                        if timed_out {
-                            handle.abort();
-                            let _ = handle.await;
-                        }
-                        info!("exit");
-                        return Ok(());
-                    }
-                    _ = &mut sigterm_fut => {
-                        info!("bridge received SIGTERM; shutting down gracefully");
-                        shutdown.cancel();
-                        let timed_out = tokio::time::timeout(
-                            std::time::Duration::from_secs(3),
-                            &mut handle,
-                        ).await.is_err();
-                        if timed_out {
-                            handle.abort();
-                            let _ = handle.await;
-                        }
-                        return Ok(());
-                    }
-                    result = &mut handle => {
-                        match result {
-                            Ok(BridgeStop::TokenRejected) if using_explicit_token => {
-                                let via = app.via();
-                                let hint = if via.is_direct() {
-                    "via: direct 下请重新 `--pair` 扫码登录真实上游，或更换为有效的 WEIXIN_TOKEN。"
-                                } else {
-                    "via: hub 下请重新执行 `ilink-hub register` 或 `im-agentproc --force-register`。"
-                                };
-                                anyhow::bail!(
-                                    "WEIXIN_TOKEN / --token 被拒绝（未注册或已失效）。{hint}"
-                                );
-                            }
-                            Ok(BridgeStop::TokenRejected) => {
-                                let via = app.via();
-                                let what = if via.is_direct() {
-                                    "direct token"
-                                } else {
-                                    "hub token"
-                                };
-                                warn!(
-                                    path = %cred_path.display(),
-                                    "{what} revoked at runtime; removing credentials and reconnecting"
-                                );
-                                let _ = tokio::fs::remove_file(&cred_path).await;
-                                continue 'reconnect;
-                            }
-                            Ok(BridgeStop::FatalCliError(reason)) => {
-                                anyhow::bail!(
-                                    "CLI 认证失败，需要用户处理后重启 bridge：{reason}"
-                                );
-                            }
-                            Ok(BridgeStop::Shutdown) => {
-                                info!("bridge shut down gracefully");
-                                return Ok(());
-                            }
-                            Err(e) => {
-                                return Err(e).context("bridge task panicked or failed");
-                            }
-                        }
-                    }
-                }
-            }
+            im_agentproc::bridge::run_loop::run_bridge_reconnecting(
+                im_agentproc::bridge::run_loop::BridgeRunOptions {
+                    app,
+                    config_path,
+                    registry: TransportRegistry::with_builtins(),
+                    hub_url: cli.hub_url.clone(),
+                    explicit_token: explicit_token(&cli).map(str::to_string),
+                    cred_file: cli.cred_file.clone(),
+                    force_pair: cli.pair,
+                    force_register: cli.force_register,
+                    register_name: cli.register_name.clone(),
+                    allow_null_transport: cli.allow_null_transport,
+                    no_interactive: cli.no_interactive,
+                },
+            )
+            .await
         }
     }
 }
@@ -565,12 +403,6 @@ fn get_hub_url_default() -> String {
 mod tests {
     use super::*;
     use im_agentproc::bridge::transport::registry::resolve_direct_base_url;
-
-    fn write_yaml(dir: &Path, content: &str) -> PathBuf {
-        let p = dir.join("profile.yaml");
-        std::fs::write(&p, content).unwrap();
-        p
-    }
 
     /// Global mutex serialising any test that mutates process env. Tests run
     /// in parallel by default, but `std::env::set_var` / `remove_var` mutate
@@ -637,214 +469,77 @@ mod tests {
         assert!(!cli.no_interactive);
     }
 
-    #[test]
-    fn build_transport_direct_bails_without_base_url() {
-        // End-to-end-ish: build_transport on a via: direct profile with no base_url
-        // and the default hub-url bails at the M2 gate before any network call.
-        let dir = tempfile::tempdir().unwrap();
-        let cfg = write_yaml(
-            dir.path(),
-            "agentproc:\n  command: echo\n  args: [\"ok\"]\nvia: direct\n",
-        );
-        let app = BridgeApp::load(&cfg).unwrap();
-        let cli = Cli::parse_from(["im-agentproc", "--hub-url", "http://127.0.0.1:8765"]);
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let err = match rt.block_on(build_transport(&app, &cli, &cfg, None, true)) {
-            Ok(_) => panic!("expected M2 bail, got transport"),
-            Err(e) => e,
-        };
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("via: direct") && msg.contains("base_url"),
-            "expected M2 bail: {msg}"
-        );
-    }
 
-    #[test]
-    fn build_transport_unknown_transport_bails_without_allow_flag() {
-        // L4: an unknown transport fails fast unless --allow-null-transport is set.
-        let dir = tempfile::tempdir().unwrap();
-        let cfg = write_yaml(
-            dir.path(),
-            "agentproc:\n  command: echo\n  args: [\"ok\"]\ntransport: foobar-unknown\n",
-        );
-        let app = BridgeApp::load(&cfg).unwrap();
-        let cli = Cli::parse_from(["im-agentproc", "--hub-url", "http://127.0.0.1:8765"]);
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let err = match rt.block_on(build_transport(&app, &cli, &cfg, None, true)) {
-            Ok(_) => panic!("expected L4 bail, got transport"),
-            Err(e) => e,
-        };
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("foobar-unknown") && msg.contains("--allow-null-transport"),
-            "expected L4 bail mentioning transport + flag: {msg}"
-        );
-    }
 
-    #[test]
-    fn build_transport_wecom_bails_without_credentials() {
-        // wecom is a real transport; without credentials it should bail fast.
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        clear_im_credential_env();
-        let dir = tempfile::tempdir().unwrap();
-        let cfg = write_yaml(
-            dir.path(),
-            "agentproc:\n  command: echo\n  args: [\"ok\"]\ntransport: wecom\n",
-        );
-        let app = BridgeApp::load(&cfg).unwrap();
-        let cli = Cli::parse_from(["im-agentproc", "--hub-url", "http://127.0.0.1:8765"]);
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let err = match rt.block_on(build_transport(&app, &cli, &cfg, None, true)) {
-            Ok(_) => panic!("expected credential bail, got transport"),
-            Err(e) => e,
-        };
-        let msg = format!("{err:#}");
-        assert!(
-            msg.to_lowercase().contains("bot_id") || msg.to_lowercase().contains("wecom"),
-            "expected missing credentials error: {msg}"
-        );
-    }
 
-    #[test]
-    fn build_transport_telegram_bails_without_token() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        clear_im_credential_env();
-        let dir = tempfile::tempdir().unwrap();
-        let cfg = write_yaml(
-            dir.path(),
-            "agentproc:\n  command: echo\n  args: [\"ok\"]\ntransport: telegram\n",
-        );
-        let app = BridgeApp::load(&cfg).unwrap();
-        let cli = Cli::parse_from(["im-agentproc", "--hub-url", "http://127.0.0.1:8765"]);
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let err = match rt.block_on(build_transport(&app, &cli, &cfg, None, true)) {
-            Ok(_) => panic!("expected credential bail, got transport"),
-            Err(e) => e,
-        };
-        let msg = format!("{err:#}");
-        assert!(
-            msg.to_lowercase().contains("token") && msg.to_lowercase().contains("telegram"),
-            "expected telegram/token error: {msg}"
-        );
-    }
 
-    #[test]
-    fn build_transport_feishu_bails_without_app_secret() {
-        // Only app_id is set; the second secret check should fire.
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        clear_im_credential_env();
-        let dir = tempfile::tempdir().unwrap();
-        let cfg = write_yaml(
-            dir.path(),
-            "agentproc:\n  command: echo\n  args: [\"ok\"]\n\
-             transport: feishu\n\
-             im_credentials:\n  app_id: \"cli_xxx\"\n",
-        );
-        let app = BridgeApp::load(&cfg).unwrap();
-        let cli = Cli::parse_from(["im-agentproc", "--hub-url", "http://127.0.0.1:8765"]);
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let err = match rt.block_on(build_transport(&app, &cli, &cfg, None, true)) {
-            Ok(_) => panic!("expected credential bail, got transport"),
-            Err(e) => e,
-        };
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("app_secret") && msg.contains("feishu"),
-            "expected feishu/app_secret error: {msg}"
-        );
-    }
 
-    #[test]
-    fn build_transport_wecom_bails_without_bot_secret() {
-        // bot_id is set but bot_secret isn't — the second secret check should fire.
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        clear_im_credential_env();
-        let dir = tempfile::tempdir().unwrap();
-        let cfg = write_yaml(
-            dir.path(),
-            "agentproc:\n  command: echo\n  args: [\"ok\"]\n\
-             transport: wecom\n\
-             im_credentials:\n  bot_id: \"wxyz\"\n",
-        );
-        let app = BridgeApp::load(&cfg).unwrap();
-        let cli = Cli::parse_from(["im-agentproc", "--hub-url", "http://127.0.0.1:8765"]);
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let err = match rt.block_on(build_transport(&app, &cli, &cfg, None, true)) {
-            Ok(_) => panic!("expected credential bail, got transport"),
-            Err(e) => e,
-        };
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("bot_secret") && msg.contains("wecom"),
-            "expected wecom/bot_secret error: {msg}"
-        );
-    }
 
-    #[test]
-    fn build_transport_discord_bails_without_token() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        clear_im_credential_env();
-        let dir = tempfile::tempdir().unwrap();
-        let cfg = write_yaml(
-            dir.path(),
-            "agentproc:\n  command: echo\n  args: [\"ok\"]\ntransport: discord\n",
-        );
-        let app = BridgeApp::load(&cfg).unwrap();
-        let cli = Cli::parse_from(["im-agentproc", "--hub-url", "http://127.0.0.1:8765"]);
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let err = match rt.block_on(build_transport(&app, &cli, &cfg, None, true)) {
-            Ok(_) => panic!("expected credential bail, got transport"),
-            Err(e) => e,
-        };
-        let msg = format!("{err:#}");
-        assert!(
-            msg.to_lowercase().contains("token") && msg.to_lowercase().contains("discord"),
-            "expected discord/token error: {msg}"
-        );
-    }
 
     // ── resolve_mcp_transport env-var wiring ─────────────────────────────────
     // We serialise on the same ENV_LOCK + clear_im_credential_env helper used
     // by the factory tests so concurrent runs can't race on env reads.
-    #[test]
-    fn resolve_mcp_transport_unknown_name_bails() {
+    // Deliberately holds ENV_LOCK across awaits: the resolver reads process
+    // env, and #[tokio::test] runs on a single-threaded runtime, so no other
+    // task can observe the guarded window anyway.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn resolve_mcp_transport_unknown_name_bails() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         clear_im_credential_env();
-        match resolve_mcp_transport("webex") {
+        match resolve_mcp_transport("webex").await {
             Err(err) => assert!(format!("{err:#}").contains("unknown transport")),
             Ok(_) => panic!("expected unknown-transport error"),
         }
     }
 
-    #[test]
-    fn resolve_mcp_transport_telegram_missing_token_bails() {
+    // Deliberately holds ENV_LOCK across awaits: the resolver reads process
+    // env, and #[tokio::test] runs on a single-threaded runtime, so no other
+    // task can observe the guarded window anyway.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn resolve_mcp_transport_telegram_missing_token_bails() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         clear_im_credential_env();
-        match resolve_mcp_transport("telegram") {
-            Err(err) => assert!(format!("{err:#}").contains("TELEGRAM_TOKEN")),
+        match resolve_mcp_transport("telegram").await {
+            // adapter-owned credential error names both sources
+            Err(err) => assert!(
+                format!("{err:#}").to_lowercase().contains("token"),
+                "expected missing-credential error"
+            ),
             Ok(_) => panic!("expected missing-credential error"),
         }
     }
 
-    #[test]
-    fn resolve_mcp_transport_feishu_missing_app_secret_bails() {
+    // Deliberately holds ENV_LOCK across awaits: the resolver reads process
+    // env, and #[tokio::test] runs on a single-threaded runtime, so no other
+    // task can observe the guarded window anyway.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn resolve_mcp_transport_feishu_missing_app_secret_bails() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         clear_im_credential_env();
         // SAFETY: held under ENV_LOCK.
         unsafe {
             std::env::set_var("IM_AGENTPROC_MCP_FEISHU_APP_ID", "cli_x");
         }
-        let result = resolve_mcp_transport("feishu");
+        let result = resolve_mcp_transport("feishu").await;
         unsafe {
             std::env::remove_var("IM_AGENTPROC_MCP_FEISHU_APP_ID");
         }
         match result {
-            Err(err) => assert!(format!("{err:#}").contains("FEISHU_APP_SECRET")),
+            Err(err) => assert!(
+                format!("{err:#}").to_lowercase().contains("secret"),
+                "expected missing-credential error"
+            ),
             Ok(_) => panic!("expected missing-credential error"),
         }
     }
 
+    // Deliberately holds ENV_LOCK across awaits: the resolver reads process
+    // env, and #[tokio::test] runs on a single-threaded runtime, so no other
+    // task can observe the guarded window anyway.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn resolve_mcp_transport_discord_succeeds_when_token_set() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -856,7 +551,7 @@ mod tests {
         // DiscordTransport::new spawns a WS worker that will fail to
         // connect to the real Gateway — that's fine; we only need to verify
         // the env-var → Transport construction chain works.
-        let result = resolve_mcp_transport("discord");
+        let result = resolve_mcp_transport("discord").await;
         unsafe {
             std::env::remove_var("IM_AGENTPROC_MCP_DISCORD_TOKEN");
         }
@@ -865,60 +560,5 @@ mod tests {
         assert!(transport.capabilities().media_upload);
     }
 
-    #[test]
-    fn build_transport_unknown_transport_succeeds_with_allow_flag() {
-        // With --allow-null-transport, an unknown transport loads a NullTransport
-        // placeholder instead of failing. Confirms the escape hatch actually works.
-        let dir = tempfile::tempdir().unwrap();
-        let cfg = write_yaml(
-            dir.path(),
-            "agentproc:\n  command: echo\n  args: [\"ok\"]\ntransport: foobar-unknown\n",
-        );
-        let app = BridgeApp::load(&cfg).unwrap();
-        let cli = Cli::parse_from([
-            "im-agentproc",
-            "--hub-url",
-            "http://127.0.0.1:8765",
-            "--allow-null-transport",
-        ]);
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let t = rt
-            .block_on(build_transport(&app, &cli, &cfg, None, true))
-            .expect("NullTransport placeholder should build");
-        // NullTransport advertises default capabilities (no media_upload).
-        let caps = t.capabilities();
-        assert!(!caps.media_upload);
-    }
 
-    #[test]
-    fn build_transport_telegram_falls_back_to_env_token() {
-        // No im_credentials.token in YAML, but TELEGRAM_BOT_TOKEN in env → must
-        // construct successfully. TelegramTransport::new is purely local
-        // (no network), so this stays hermetic.
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        clear_im_credential_env();
-        let dir = tempfile::tempdir().unwrap();
-        let cfg = write_yaml(
-            dir.path(),
-            "agentproc:\n  command: echo\n  args: [\"ok\"]\ntransport: telegram\n",
-        );
-        let app = BridgeApp::load(&cfg).unwrap();
-        let cli = Cli::parse_from(["im-agentproc", "--hub-url", "http://127.0.0.1:8765"]);
-        // SAFETY: held under ENV_LOCK.
-        unsafe {
-            std::env::set_var("TELEGRAM_BOT_TOKEN", "test-token-only");
-        }
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let result = rt.block_on(build_transport(&app, &cli, &cfg, None, true));
-        // SAFETY: still under ENV_LOCK; _guard drops at end of fn.
-        unsafe {
-            std::env::remove_var("TELEGRAM_BOT_TOKEN");
-        }
-        let t = result.expect("TelegramTransport should build from env var");
-        let caps = t.capabilities();
-        assert!(
-            caps.media_upload,
-            "Telegram transport reports media_upload=true (send_media implemented)"
-        );
-    }
 }

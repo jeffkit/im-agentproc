@@ -11,6 +11,7 @@ pub mod manager;
 mod paths;
 mod probe;
 pub mod protocol;
+pub mod run_loop;
 pub mod transport;
 pub mod vtoken_env;
 

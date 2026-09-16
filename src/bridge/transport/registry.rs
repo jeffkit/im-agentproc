@@ -94,6 +94,22 @@ impl TransportRegistry {
         reg
     }
 
+    /// Registry for the MCP outbound subprocess (`im-agentproc mcp-server`).
+    /// Unlike the profile path, there is no interactive credential flow: the
+    /// manager resolves credentials into `IM_AGENTPROC_MCP_{KIND}_{KEY}` env
+    /// vars, which the caller collects into `ctx.im_credentials`
+    /// (`{key}` lowercased, e.g. `TELEGRAM_TOKEN` → `token`); factories then
+    /// construct adapters directly.
+    pub fn with_mcp_builtins() -> Self {
+        let mut reg = Self::new();
+        reg.register("ilink", mcp_ilink_entry);
+        reg.register("telegram", telegram_entry);
+        reg.register("wecom", wecom_entry);
+        reg.register("feishu", feishu_entry);
+        reg.register("discord", discord_entry);
+        reg
+    }
+
     /// Register (or replace) the factory for a transport kind.
     pub fn register<F>(&mut self, kind: &str, factory: F)
     where
@@ -184,6 +200,25 @@ fn ilink_entry(ctx: &TransportBuildCtx) -> BoxFuture<'_, Result<Arc<dyn Transpor
 
 fn null_entry(ctx: &TransportBuildCtx) -> BoxFuture<'_, Result<Arc<dyn Transport>>> {
     Box::pin(null_factory(ctx))
+}
+
+fn mcp_ilink_entry(ctx: &TransportBuildCtx) -> BoxFuture<'_, Result<Arc<dyn Transport>>> {
+    Box::pin(async move {
+        // MCP subprocess path: the manager hands over a pre-resolved hub URL +
+        // token (no interactive registration). Same env-key contract as the
+        // other MCP kinds: IM_AGENTPROC_MCP_ILINK_HUB_URL / _ILINK_TOKEN.
+        let hub_url = ctx
+            .im_credentials
+            .get("hub_url")
+            .context("IM_AGENTPROC_MCP_ILINK_HUB_URL is required")?;
+        let token = ctx
+            .im_credentials
+            .get("token")
+            .context("IM_AGENTPROC_MCP_ILINK_TOKEN is required")?;
+        Ok(Arc::new(
+            IlinkTransport::new(hub_url.clone(), token.clone()).context("build iLink transport")?,
+        ) as Arc<dyn Transport>)
+    })
 }
 
 async fn null_factory(ctx: &TransportBuildCtx) -> Result<Arc<dyn Transport>> {
