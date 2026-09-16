@@ -1,6 +1,6 @@
 [package]
 name = "im-agentproc"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "IM-side runtime for the agentproc ecosystem: bridge an IM transport (iLink/WeChat today) to local coding CLIs (Claude Code, Codex, …) via agentproc profiles."
 license = "MIT"

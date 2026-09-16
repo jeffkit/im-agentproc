@@ -6,6 +6,21 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-16
+
+### Added
+
+- **Pluggable transport registry.** New `bridge::transport::registry` maps the
+  profile's `transport:` kind to an async factory (`TransportRegistry` +
+  `TransportBuildCtx`), replacing the hardcoded `match` in the binary. Built-ins
+  register `ilink` (hub/direct), `telegram`, `wecom`, `feishu`, `discord` and the
+  `null` placeholder; downstream crates can `register(kind, factory)` their own
+  adapters. Credential parsing (incl. env fallback) moved into each adapter's
+  `from_credentials`. Unknown kinds still fail fast unless
+  `--allow-null-transport` (L4); the direct-mode M2 guard is unchanged.
+- **Push/webhook adapter pattern** documented in `docs/transport.md`
+  (adapter-hosted receiver → internal buffer → `next_inbound` drain).
+
 ## [0.2.0] - 2026-07-27
 
 ### Added
