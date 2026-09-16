@@ -14,6 +14,7 @@
 //! downloaded to temp files and forwarded as `MediaRef` attachments.
 
 use std::time::Duration;
+use std::collections::HashMap;
 
 use anyhow::{Context, Result};
 use futures_util::future::BoxFuture;
@@ -160,6 +161,24 @@ pub struct TelegramTransport {
 }
 
 impl TelegramTransport {
+    /// Resolve adapter-owned credentials (profile `im_credentials.token` →
+    /// env `TELEGRAM_BOT_TOKEN`) and build the transport.
+    pub fn from_credentials(creds: &HashMap<String, String>) -> Result<Self> {
+        let token = creds
+            .get("token")
+            .filter(|s| !s.trim().is_empty())
+            .cloned()
+            .or_else(|| {
+                std::env::var("TELEGRAM_BOT_TOKEN")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+            })
+            .context(
+                "transport: telegram 需要 im_credentials.token 或环境变量 TELEGRAM_BOT_TOKEN",
+            )?;
+        Self::new(token)
+    }
+
     /// Create a new transport with the given bot token.
     pub fn new(token: String) -> Result<Self> {
         Self::with_base_url(token, BASE_URL.to_string())

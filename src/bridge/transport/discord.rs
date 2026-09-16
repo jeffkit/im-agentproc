@@ -10,6 +10,7 @@
 //! <https://discord.com/developers/docs/events/gateway>
 
 use std::sync::Arc;
+use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -512,6 +513,24 @@ pub struct DiscordTransport {
 }
 
 impl DiscordTransport {
+    /// Resolve adapter-owned credentials (profile `im_credentials.token` →
+    /// env `DISCORD_BOT_TOKEN`).
+    pub fn from_credentials(creds: &HashMap<String, String>) -> Result<Self> {
+        let token = creds
+            .get("token")
+            .filter(|s| !s.trim().is_empty())
+            .cloned()
+            .or_else(|| {
+                std::env::var("DISCORD_BOT_TOKEN")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+            })
+            .context(
+                "transport: discord 需要 im_credentials.token 或环境变量 DISCORD_BOT_TOKEN",
+            )?;
+        Self::new(token)
+    }
+
     /// 创建 Transport 并在后台启动 Discord Gateway WebSocket 连接。
     pub fn new(bot_token: String) -> Result<Self> {
         Self::with_api_base(bot_token, DISCORD_API.to_string())

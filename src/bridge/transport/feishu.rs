@@ -12,6 +12,7 @@
 //! <https://open.feishu.cn/document/ukTMukTMukTM/uYDNxYjL2QTM24iN0EjN/event-subscription-configure->
 
 use std::sync::Arc;
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -102,6 +103,34 @@ pub struct FeishuTransport {
 }
 
 impl FeishuTransport {
+    /// Resolve adapter-owned credentials (profile `im_credentials.app_id` /
+    /// `app_secret` → env `FEISHU_APP_ID` / `FEISHU_APP_SECRET`).
+    pub fn from_credentials(creds: &HashMap<String, String>) -> Result<Self> {
+        let app_id = creds
+            .get("app_id")
+            .filter(|s| !s.trim().is_empty())
+            .cloned()
+            .or_else(|| {
+                std::env::var("FEISHU_APP_ID")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+            })
+            .context("transport: feishu 需要 im_credentials.app_id 或环境变量 FEISHU_APP_ID")?;
+        let app_secret = creds
+            .get("app_secret")
+            .filter(|s| !s.trim().is_empty())
+            .cloned()
+            .or_else(|| {
+                std::env::var("FEISHU_APP_SECRET")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+            })
+            .context(
+                "transport: feishu 需要 im_credentials.app_secret 或环境变量 FEISHU_APP_SECRET",
+            )?;
+        Self::new(app_id, app_secret)
+    }
+
     /// 创建 Transport 并在后台启动飞书 WebSocket 长连接。
     pub fn new(app_id: String, app_secret: String) -> Result<Self> {
         Self::with_api_base(app_id, app_secret, FEISHU_API.to_string())

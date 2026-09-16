@@ -26,14 +26,13 @@ use tracing::{info, warn};
 use std::io::IsTerminal;
 
 use anyhow::Context;
+use im_agentproc::bridge::transport::registry::{TransportBuildCtx, TransportRegistry};
 use im_agentproc::bridge::transport::{
-    DiscordTransport, FeishuTransport, IlinkTransport, NullTransport, TelegramTransport, Transport,
-    WecomTransport,
+    DiscordTransport, FeishuTransport, IlinkTransport, TelegramTransport, Transport, WecomTransport,
 };
 use im_agentproc::bridge::{
     builtin, default_direct_credential_path, default_local_credential_path,
-    resolve_direct_connection, resolve_hub_connection, run_bridge_with_shutdown, BridgeApp,
-    BridgeStop, Via,
+    run_bridge_with_shutdown, BridgeApp, BridgeStop, Via,
 };
 use im_agentproc::mcp::{
     run_server, OutboundDelivery, SendFileTool, SendImageTool, SendTextTool, SendVoiceTool,
@@ -189,53 +188,16 @@ fn explicit_token(cli: &Cli) -> Option<&str> {
         .filter(|s| !s.is_empty())
 }
 
-/// The localhost Hub URL used as the CLI default when `WEIXIN_BASE_URL` is unset.
-/// `via: direct` refusing to fall back to this value prevents silently pointing
-/// a direct bridge at a Hub/localhost (review M2).
-const DEFAULT_HUB_URL: &str = "http://127.0.0.1:8765";
+use im_agentproc::bridge::transport::registry::DEFAULT_HUB_URL;
 
-/// Resolve the iLink upstream base URL for a `via: direct` profile (review M2).
-///
-/// - A YAML `base_url:` always wins (lets a manager mix hub/direct profiles
-///   against different upstreams).
-/// - Otherwise the CLI/env `--hub-url` / `WEIXIN_BASE_URL` is used — but the
-///   localhost Hub default is rejected, so a direct bridge never silently
-///   targets a Hub/localhost and fires `get_bot_qrcode` at the wrong server.
-fn resolve_direct_base_url(direct_base_url: Option<&str>, cli_hub_url: &str) -> Result<String> {
-    if let Some(b) = direct_base_url {
-        let trimmed = b.trim();
-        if trimmed.is_empty() {
-            anyhow::bail!(
-                "via: direct profile has empty `base_url:`; set it to the real iLink upstream"
-            );
-        }
-        return Ok(trimmed.trim_end_matches('/').to_string());
-    }
-    let cli_base = cli_hub_url.trim().trim_end_matches('/').to_string();
-    if cli_base == DEFAULT_HUB_URL {
-        anyhow::bail!(
-            "via: direct 需要显式 `base_url:`（YAML）或非默认 `WEIXIN_BASE_URL` 指向真实 iLink 上游。\
-             当前 base 仍是默认 localhost Hub 地址 ({DEFAULT_HUB_URL})，直接对它发 get_bot_qrcode \
-             语义错误。若确实要连本机 Hub，请改用 `via: hub`。"
-        );
-    }
-    Ok(cli_base)
-}
 
-/// Build the configured transport for the bridge run.
+/// Launch the outbound-media MCP stdio server as a sub-process entrypoint.
 ///
-/// - `transport: ilink` (default): resolve credentials via Hub or direct iLink.
-/// - `transport: telegram`: Telegram Bot API long-poll. Requires `im_credentials.token`.
-/// - `transport: wecom`: WeCom smart-bot WebSocket. Requires `im_credentials.bot_id` + `bot_secret`.
-/// - `transport: feishu`: Feishu WebSocket long connection. Requires `im_credentials.app_id` + `app_secret`.
-/// - `transport: discord`: Discord Gateway WebSocket. Requires `im_credentials.token`.
-/// - `transport: <other>`: load a `NullTransport` placeholder only when
-///   `--allow-null-transport` is set; otherwise fail fast.
+/// The bridge manager launches this sub-process after resolving the
+/// transport + inbound context. We read those from env vars here.
 async fn run_mcp_server() -> Result<()> {
     use std::sync::Arc;
 
-    // The bridge manager launches this sub-process after resolving the
-    // transport + inbound context. We read those from env vars here.
     let transport_name = std::env::var("IM_AGENTPROC_MCP_TRANSPORT")
         .ok()
         .filter(|s| !s.trim().is_empty())
@@ -308,6 +270,15 @@ fn resolve_mcp_transport(transport_name: &str) -> Result<Arc<dyn Transport>> {
     Ok(transport)
 }
 
+/// Build the configured transport for the bridge run.
+///
+/// Transport selection goes through the pluggable registry
+/// ([`TransportRegistry::with_builtins`]): each `transport:` kind resolves to a
+/// registered factory (ilink hub/direct, telegram, wecom, feishu, discord; each
+/// adapter owns its credential parsing), and an unknown kind fails fast unless
+/// `--allow-null-transport` opts into the `NullTransport` placeholder (L4).
+/// New IM channels register a factory instead of editing this function — see
+/// `docs/transport.md`.
 async fn build_transport(
     app: &BridgeApp,
     cli: &Cli,
@@ -315,176 +286,30 @@ async fn build_transport(
     description: Option<&str>,
     interactive: bool,
 ) -> Result<Arc<dyn Transport>> {
-    let transport = app.transport();
-    let creds = app.im_credentials();
-
-    let t: Arc<dyn Transport> = match transport.as_str() {
-        "ilink" => build_ilink_transport(app, cli, config_path, description, interactive).await?,
-
-        "telegram" => {
-            let token = creds
-                .get("token")
-                .filter(|s| !s.trim().is_empty())
-                .cloned()
-                .or_else(|| {
-                    std::env::var("TELEGRAM_BOT_TOKEN")
-                        .ok()
-                        .filter(|s| !s.trim().is_empty())
-                })
-                .context(
-                    "transport: telegram 需要 im_credentials.token 或环境变量 TELEGRAM_BOT_TOKEN",
-                )?;
-            info!(
-                transport = "telegram",
-                "building Telegram Bot API transport"
-            );
-            Arc::new(TelegramTransport::new(token).context("build Telegram transport")?)
-        }
-
-        "wecom" => {
-            let bot_id = creds
-                .get("bot_id")
-                .filter(|s| !s.trim().is_empty())
-                .cloned()
-                .or_else(|| {
-                    std::env::var("WECOM_BOT_ID")
-                        .ok()
-                        .filter(|s| !s.trim().is_empty())
-                })
-                .context("transport: wecom 需要 im_credentials.bot_id 或环境变量 WECOM_BOT_ID")?;
-            let bot_secret = creds
-                .get("bot_secret")
-                .filter(|s| !s.trim().is_empty())
-                .cloned()
-                .or_else(|| {
-                    std::env::var("WECOM_BOT_SECRET")
-                        .ok()
-                        .filter(|s| !s.trim().is_empty())
-                })
-                .context(
-                    "transport: wecom 需要 im_credentials.bot_secret 或环境变量 WECOM_BOT_SECRET",
-                )?;
-            info!(
-                transport = "wecom",
-                "building WeCom Bot WebSocket transport"
-            );
-            Arc::new(WecomTransport::new(bot_id, bot_secret))
-        }
-
-        "feishu" => {
-            let app_id = creds
-                .get("app_id")
-                .filter(|s| !s.trim().is_empty())
-                .cloned()
-                .or_else(|| {
-                    std::env::var("FEISHU_APP_ID")
-                        .ok()
-                        .filter(|s| !s.trim().is_empty())
-                })
-                .context("transport: feishu 需要 im_credentials.app_id 或环境变量 FEISHU_APP_ID")?;
-            let app_secret = creds
-                .get("app_secret")
-                .filter(|s| !s.trim().is_empty())
-                .cloned()
-                .or_else(|| {
-                    std::env::var("FEISHU_APP_SECRET")
-                        .ok()
-                        .filter(|s| !s.trim().is_empty())
-                })
-                .context(
-                    "transport: feishu 需要 im_credentials.app_secret 或环境变量 FEISHU_APP_SECRET",
-                )?;
-            info!(transport = "feishu", "building Feishu WebSocket transport");
-            Arc::new(FeishuTransport::new(app_id, app_secret).context("build Feishu transport")?)
-        }
-
-        "discord" => {
-            let token = creds
-                .get("token")
-                .filter(|s| !s.trim().is_empty())
-                .cloned()
-                .or_else(|| {
-                    std::env::var("DISCORD_BOT_TOKEN")
-                        .ok()
-                        .filter(|s| !s.trim().is_empty())
-                })
-                .context(
-                    "transport: discord 需要 im_credentials.token 或环境变量 DISCORD_BOT_TOKEN",
-                )?;
-            info!(
-                transport = "discord",
-                "building Discord Gateway WebSocket transport"
-            );
-            Arc::new(DiscordTransport::new(token).context("build Discord transport")?)
-        }
-
-        name => {
-            if !cli.allow_null_transport {
-                anyhow::bail!(
-                    "transport `{name}` 没有真实适配器（占位 NullTransport 会永久退避成僵尸进程）。\
-                     如仅为可插拔冒烟测试，请加 `--allow-null-transport` 显式开启占位。"
-                );
-            }
-            info!(transport = %name, "loading placeholder transport (allow_null_transport)");
-            Arc::new(NullTransport::new(name.to_string()))
-        }
+    let registry = TransportRegistry::with_builtins();
+    let ctx = TransportBuildCtx {
+        kind: app.transport().as_str().to_string(),
+        via: app.via(),
+        hub_url: cli.hub_url.clone(),
+        direct_base_url: app.direct_base_url().map(str::to_string),
+        im_credentials: app.im_credentials().clone(),
+        explicit_token: explicit_token(cli).map(str::to_string),
+        cred_file: cli.cred_file.clone(),
+        force_pair: cli.pair,
+        force_register: cli.force_register,
+        register_name: cli.register_name.clone(),
+        config_path: Some(config_path.to_path_buf()),
+        description: description.map(str::to_string),
+        interactive,
+        allow_null_placeholder: cli.allow_null_transport,
     };
-
+    let t = registry.build(&ctx).await?;
     let caps = t.capabilities();
     info!(
-        transport = transport.as_str(),
+        transport = ctx.kind.as_str(),
         media_upload = caps.media_upload,
         "transport built"
     );
-    Ok(t)
-}
-
-/// Build the iLink transport (Hub or Direct). Extracted from the main `build_transport`
-/// to keep it readable.
-async fn build_ilink_transport(
-    app: &BridgeApp,
-    cli: &Cli,
-    config_path: &Path,
-    description: Option<&str>,
-    interactive: bool,
-) -> Result<Arc<dyn Transport>> {
-    let t: Arc<dyn Transport> = match app.via() {
-        Via::Hub => {
-            let (hub_url, token) = resolve_hub_connection(
-                &cli.hub_url,
-                explicit_token(cli),
-                cli.cred_file.as_deref(),
-                cli.pair,
-                cli.register_name.as_deref(),
-                cli.force_register,
-                Some(config_path),
-                description,
-            )
-            .await?;
-            info!(%hub_url, via = "hub", "using Hub base URL for downstream");
-            Arc::new(IlinkTransport::new(hub_url, token).context("build iLink transport")?)
-        }
-        Via::Direct => {
-            let base = resolve_direct_base_url(app.direct_base_url(), &cli.hub_url)?;
-            let (base, token) = resolve_direct_connection(
-                &base,
-                explicit_token(cli),
-                cli.cred_file.as_deref(),
-                cli.pair,
-                cli.force_register,
-                Some(config_path),
-                interactive,
-            )
-            .await?;
-            info!(base = %base, via = "direct", "connecting directly to iLink upstream");
-            info!(
-                "via: direct 不支持跨消息 CLI 会话续接（真实上游不回显 session_id）；每条消息起新 CLI 会话。"
-            );
-            Arc::new(IlinkTransport::new(base, token).context("build iLink transport (direct)")?)
-        }
-    };
-    let caps = t.capabilities();
-    info!(via = ?app.via(), media_upload = caps.media_upload, "iLink transport capabilities");
     Ok(t)
 }
 
@@ -733,12 +558,13 @@ fn get_hub_url_default() -> String {
             }
         }
     }
-    "http://127.0.0.1:8765".to_string()
+    DEFAULT_HUB_URL.to_string()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use im_agentproc::bridge::transport::registry::resolve_direct_base_url;
 
     fn write_yaml(dir: &Path, content: &str) -> PathBuf {
         let p = dir.join("profile.yaml");

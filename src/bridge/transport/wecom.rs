@@ -12,6 +12,7 @@
 //! <https://developer.work.weixin.qq.com/document/path/101463>
 
 use std::sync::Arc;
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -469,6 +470,34 @@ pub struct WecomTransport {
 }
 
 impl WecomTransport {
+    /// Resolve adapter-owned credentials (profile `im_credentials.bot_id` /
+    /// `bot_secret` → env `WECOM_BOT_ID` / `WECOM_BOT_SECRET`).
+    pub fn from_credentials(creds: &HashMap<String, String>) -> Result<Self> {
+        let bot_id = creds
+            .get("bot_id")
+            .filter(|s| !s.trim().is_empty())
+            .cloned()
+            .or_else(|| {
+                std::env::var("WECOM_BOT_ID")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+            })
+            .context("transport: wecom 需要 im_credentials.bot_id 或环境变量 WECOM_BOT_ID")?;
+        let bot_secret = creds
+            .get("bot_secret")
+            .filter(|s| !s.trim().is_empty())
+            .cloned()
+            .or_else(|| {
+                std::env::var("WECOM_BOT_SECRET")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+            })
+            .context(
+                "transport: wecom 需要 im_credentials.bot_secret 或环境变量 WECOM_BOT_SECRET",
+            )?;
+        Ok(Self::new(bot_id, bot_secret))
+    }
+
     /// Create the transport and spawn the background WebSocket worker.
     pub fn new(bot_id: String, bot_secret: String) -> Self {
         let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();

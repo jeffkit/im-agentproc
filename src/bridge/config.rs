@@ -6,9 +6,11 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
-/// Which IM protocol the bridge speaks. Stage 2: only `ilink` is implemented;
-/// any other string loads a `NullTransport` placeholder to prove the transport
-/// seam is pluggable (real adapters land in later stages).
+/// Which IM protocol the bridge speaks. An open string wrapper (not a closed
+/// enum) so new transports register a factory in the `TransportRegistry`
+/// (`src/bridge/transport/registry.rs`) instead of adding variants here.
+/// Kinds without a registered factory fail fast at startup unless
+/// `--allow-null-transport` loads a `NullTransport` placeholder.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransportKind(String);
 
@@ -16,7 +18,7 @@ impl TransportKind {
     pub fn as_str(&self) -> &str {
         &self.0
     }
-    /// `ilink` is the only fully-implemented transport.
+    /// Whether this is the built-in `ilink` transport.
     pub fn is_ilink(&self) -> bool {
         self.0 == "ilink"
     }
@@ -118,9 +120,9 @@ pub struct BridgeProfileFile {
     #[serde(default)]
     pub agentproc: AgentprocBlock,
 
-    /// Which IM protocol to speak. Default `ilink`; any other string loads a
-    /// `NullTransport` placeholder (stage 2 pluggability proof; real adapters
-    /// arrive in later stages).
+    /// Which IM protocol to speak. Default `ilink`; other kinds resolve through
+    /// the `TransportRegistry` (unknown kinds fail fast unless
+    /// `--allow-null-transport` loads a `NullTransport` placeholder).
     #[serde(default)]
     pub transport: TransportKind,
 

@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 
 pub(crate) mod attachments;
 pub(crate) mod connection;
+pub mod registry;
 pub(crate) mod discord;
 pub(crate) mod feishu;
 pub(crate) mod ilink;
