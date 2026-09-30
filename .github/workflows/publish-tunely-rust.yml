@@ -30,13 +30,18 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_TOKEN }}
         run: |
           set -uo pipefail
-          if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
+          # ${VAR:-} 而非 $VAR：set -u 下变量完全未定义会直接报 unbound variable 退出，
+          # 那就不满足「无 token 只告警不失败」的语义了。
+          if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
             echo "::warning::Secret CRATES_TOKEN is not set — crates.io publish skipped."
             exit 0
           fi
+          # 版本号从被发布的 rust/Cargo.toml 实时读取，不硬编码（避免提示文本过时）
+          version=$(grep '^version' Cargo.toml | head -1 | cut -d'"' -f2)
+          echo "Publishing tunely v${version} to crates.io..."
           out=$(cargo publish 2>&1) && { echo "$out"; exit 0; }
           if echo "$out" | grep -q "already exists"; then
-            echo "tunely 0.1.0 already published — skipping."
+            echo "tunely v${version} already published — skipping."
             exit 0
           fi
           echo "$out"
