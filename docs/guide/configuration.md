@@ -58,7 +58,7 @@ Field-for-field the [agentproc profile spec](https://agentproc.dev/spec/):
 | `env_allowlist` | — | When set, a `${VAR}` not in the list expands to empty with a stderr warning (POSIX-style). Absent = expand against the full environment (profiles are trusted input). |
 | `timeout_secs` | `1800` | CLI stdout-read timeout. Worst-case total is `timeout_secs + 10s` (extra `child.wait()` after stdout EOF). |
 | `kill_grace_secs` | `5` | SIGTERM → SIGKILL grace period. |
-| `max_reply_chars` | `8000` | Reply body cap before truncation. |
+| `max_reply_chars` | `8000` | Reply body cap before truncation. Actual chunk size = `min(max_reply_chars, transport.max_text_len)`; `0` = never split. |
 | `truncation_suffix` | `"\n\n…(输出已截断)"` | Appended when the reply is truncated. |
 | `streaming` | `true` | Forward `{"type":"partial"}` chunks in real time. `false` → only the final `{"type":"result"}` is sent. |
 | `permission` | `false` | Enable the agentproc 0.4 tool-permission channel. `true` keeps stdin open for `permission_request`/`permission_response`. The bridge auto-approves every request (no per-profile policy). |

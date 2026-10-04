@@ -56,7 +56,7 @@ agentproc:
 | `env_allowlist` | — | 设了之后，不在列表里的 `${VAR}` 展开为空并打 stderr 警告（POSIX 风格）。不设 = 按完整环境展开（profile 是可信输入）。 |
 | `timeout_secs` | `1800` | CLI stdout 读取超时。最坏总耗时 `timeout_secs + 10s`（stdout EOF 后还有 `child.wait()`）。 |
 | `kill_grace_secs` | `5` | SIGTERM → SIGKILL 宽限期。 |
-| `max_reply_chars` | `8000` | 回复正文截断上限。 |
+| `max_reply_chars` | `8000` | 回复正文截断上限。实际分段长度 = `min(max_reply_chars, transport.max_text_len)`；`0` = 不切分。 |
 | `truncation_suffix` | `"\n\n…(输出已截断)"` | 截断时追加的后缀。 |
 | `streaming` | `true` | 实时转发 `{"type":"partial"}` 分片。`false` → 只发最终 `{"type":"result"}`。 |
 | `permission` | `false` | 开启 agentproc 0.4 工具权限通道。`true` 时 stdin 保持打开，处理 `permission_request`/`permission_response`。bridge 对请求恒 allow（无 per-profile 策略）。 |

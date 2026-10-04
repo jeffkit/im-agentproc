@@ -11,8 +11,8 @@
 //! 飞书开发者文档：
 //! <https://open.feishu.cn/document/ukTMukTMukTM/uYDNxYjL2QTM24iN0EjN/event-subscription-configure->
 
-use std::sync::Arc;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -262,9 +262,11 @@ impl Transport for FeishuTransport {
                 .await
                 .context("Feishu sendMessage JSON")?;
             if resp.code != 0 {
-                // 99991400 = message too long; treat as throttle
+                // 99991400 = message too long: deterministic rejection, do not
+                // retry (Feishu publishes no threshold, so the adapter declares
+                // no `max_text_len`).
                 if resp.code == 99991400 {
-                    return Ok(SendOutcome::Throttled {
+                    return Ok(SendOutcome::Rejected {
                         ret: resp.code as i32,
                         errmsg: resp.msg,
                     });
@@ -369,8 +371,9 @@ impl Transport for FeishuTransport {
                 .await
                 .context("Feishu sendMedia JSON")?;
             if resp.code != 0 {
+                // 99991400 = message too long: deterministic rejection, do not retry.
                 if resp.code == 99991400 {
-                    return Ok(SendOutcome::Throttled {
+                    return Ok(SendOutcome::Rejected {
                         ret: resp.code as i32,
                         errmsg: resp.msg,
                     });
@@ -387,7 +390,10 @@ impl Transport for FeishuTransport {
     }
 
     fn capabilities(&self) -> TransportCapabilities {
-        TransportCapabilities { media_upload: true }
+        TransportCapabilities {
+            media_upload: true,
+            max_text_len: None,
+        }
     }
 }
 
@@ -689,7 +695,7 @@ mod send_media_e2e_tests {
     }
 
     #[tokio::test]
-    async fn send_media_throttled_returns_throttled_outcome() {
+    async fn send_media_too_long_returns_rejected() {
         let mut server = mockito::Server::new_async().await;
         let _ = server
             .mock("POST", "/auth/v3/tenant_access_token/internal")
@@ -718,11 +724,11 @@ mod send_media_e2e_tests {
         };
         let outcome = t.send_media(ctx, png_payload()).await.expect("send ok");
         match outcome {
-            SendOutcome::Throttled { ret, errmsg } => {
+            SendOutcome::Rejected { ret, errmsg } => {
                 assert_eq!(ret, 99991400);
                 assert!(errmsg.unwrap_or_default().contains("too long"));
             }
-            other => panic!("expected Throttled, got {other:?}"),
+            other => panic!("expected Rejected, got {other:?}"),
         }
         m_send.assert_async().await;
     }

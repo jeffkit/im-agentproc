@@ -165,7 +165,7 @@ agentproc:
 | `env_allowlist` | — | 设后只允许列表内变量展开 |
 | `timeout_secs` | `1800` | CLI 超时（秒） |
 | `kill_grace_secs` | `5` | SIGTERM → SIGKILL 宽限 |
-| `max_reply_chars` | `8000` | 回复截断上限 |
+| `max_reply_chars` | `8000` | 回复截断上限；实际分段长度 = `min(max_reply_chars, 通道 max_text_len)`，`0` = 不切分 |
 | `streaming` | `true` | 实时转发 `partial` 事件 |
 | `permission` | `false` | 开启 agentproc 0.4 工具权限通道 |
 | `send_error_reply` | `true` | CLI 失败时回复给用户 |

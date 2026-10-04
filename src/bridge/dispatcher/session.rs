@@ -81,6 +81,15 @@ pub(super) async fn run_session_worker(
                                 "sendmessage throttled during shutdown error reply; user did NOT receive restart notice — M3 must cover this path when adding buffer+retry"
                             );
                         }
+                        Ok(SendOutcome::Rejected { ret, errmsg }) => {
+                            // Deterministic rejection (e.g. message too long):
+                            // the restart notice never reached the user.
+                            warn!(
+                                ret,
+                                errmsg = sanitize_errmsg(errmsg.as_deref()).as_deref(),
+                                "shutdown notice rejected deterministically; user did NOT receive restart notice"
+                            );
+                        }
                         Err(e) => warn!(error = %e, "failed to send shutdown error reply"),
                     }
                 }

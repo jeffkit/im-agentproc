@@ -160,6 +160,7 @@ If `media_upload` were false:
 | `read local media file <path>: No such file` | `file://` URL points at a path the bridge can't reach (e.g. agent ran on a different host). Use `data:` or `https:` |
 | HTTP 401 / 403 from the underlying IM API | The IM credentials (`im_credentials.*` or env fallback) are missing or expired |
 | `throttled (code=429)` | The IM rate-limited the upload. The MCP server surfaces this as `isError: true` so the agent can back off |
+| `rejected (code=...)` | The IM deterministically refused the send — most often the text is over the channel limit (Telegram 4096 / Discord 2000). Not retried; the MCP server returns `isError: true` |
 
 ## Reference
 

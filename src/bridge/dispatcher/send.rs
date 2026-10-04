@@ -8,12 +8,21 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
 
+use crate::bridge::executor::split_into_parts;
 use crate::bridge::transport::{OutboundReply, SendOutcome, Transport};
+
+/// Outcome of [`send_final_with_retry`] / [`send_final_parts`].
+#[derive(Debug)]
+pub(super) enum FinalSend {
+    /// Delivered, or best-effort give-up (budget exhausted / shutdown).
+    Done,
+    /// Deterministic rejection — never retried, never sleeps.
+    Rejected { ret: i32, errmsg: Option<String> },
+}
 
 /// Sanitize an upstream `errmsg` string for safe logging.
 ///
@@ -65,7 +74,8 @@ fn partial_reply(ctx: &str, chunk: &str, from_user: &str, session_name: &str) ->
 /// exponential backoff until it lands. `Err` clears `pending` to avoid an
 /// infinite loop on permanent transport errors; `Sent` clears `pending` and
 /// resets the attempt counter; `Throttled` keeps `pending` and bumps the
-/// attempt counter.
+/// attempt counter; `Rejected` (deterministic, e.g. text too long) clears
+/// `pending` immediately without burning any retry budget.
 ///
 /// `backoff_fn` is injected as a function pointer so tests can use a much
 /// smaller schedule without sleeping for tens of seconds; production passes
@@ -178,6 +188,18 @@ pub(super) async fn run_partial_forward_loop(
                     );
                 }
             }
+            Ok(SendOutcome::Rejected { ret, errmsg }) => {
+                warn!(
+                    ret,
+                    attempt,
+                    pending_len = pending.as_ref().map(|s| s.len()).unwrap_or(0),
+                    errmsg = sanitize_errmsg(errmsg.as_deref()).as_deref(),
+                    "partial reply rejected deterministically; dropping chunk"
+                );
+                pending = None;
+                attempt = 0;
+                first_throttle_at = None;
+            }
             Err(e) => {
                 warn!(
                     error = %e,
@@ -201,9 +223,10 @@ pub(super) async fn run_partial_forward_loop(
 /// `cli_session_id` persistence and CLI-error reply each carry one fixed
 /// payload, so we just clone-and-resend the same `OutboundReply` until delivery.
 ///
-/// Returns `Ok(())` in all cases — on delivery, on a clean give-up after the
-/// budget is exhausted, or when `shutdown` fires. Callers that map the return
-/// value to `HandleError` can treat all outcomes as "best-effort sent; move on".
+/// Returns [`FinalSend::Done`] on delivery, on a clean give-up after the
+/// budget is exhausted, or when `shutdown` fires; [`FinalSend::Rejected`] when
+/// the transport reports a deterministic rejection. Never returns `Err`, so
+/// callers can treat every other outcome as "best-effort sent; move on".
 pub(super) async fn send_final_with_retry(
     sender: &dyn Transport,
     reply: OutboundReply,
@@ -211,17 +234,27 @@ pub(super) async fn send_final_with_retry(
     max_total: Duration,
     shutdown: &CancellationToken,
     what: &'static str,
-) -> Result<()> {
+) -> FinalSend {
     let start = Instant::now();
     let mut attempt: u32 = 0;
     loop {
         let send_result = tokio::select! {
             biased;
-            _ = shutdown.cancelled() => return Ok(()),
+            _ = shutdown.cancelled() => return FinalSend::Done,
             r = sender.send_reply(reply.clone()) => r,
         };
         match send_result {
-            Ok(SendOutcome::Sent) => return Ok(()),
+            Ok(SendOutcome::Sent) => return FinalSend::Done,
+            Ok(SendOutcome::Rejected { ret, errmsg }) => {
+                warn!(
+                    ret,
+                    what,
+                    attempt,
+                    errmsg = sanitize_errmsg(errmsg.as_deref()).as_deref(),
+                    "final reply rejected deterministically; not retrying"
+                );
+                return FinalSend::Rejected { ret, errmsg };
+            }
             Ok(SendOutcome::Throttled { ret, errmsg }) => {
                 let elapsed = start.elapsed();
                 if elapsed >= max_total {
@@ -234,7 +267,7 @@ pub(super) async fn send_final_with_retry(
                         errmsg = sanitize_errmsg(errmsg.as_deref()).as_deref(),
                         "final reply abandoned: retry budget exhausted under persistent throttle"
                     );
-                    return Ok(());
+                    return FinalSend::Done;
                 }
                 attempt = attempt.saturating_add(1);
                 let wait = backoff_fn(attempt);
@@ -249,7 +282,7 @@ pub(super) async fn send_final_with_retry(
                 );
                 tokio::select! {
                     biased;
-                    _ = shutdown.cancelled() => return Ok(()),
+                    _ = shutdown.cancelled() => return FinalSend::Done,
                     _ = tokio::time::sleep(wait) => {}
                 }
             }
@@ -264,7 +297,7 @@ pub(super) async fn send_final_with_retry(
                         error = %e,
                         "final reply abandoned: retry budget exhausted under persistent transport error"
                     );
-                    return Ok(());
+                    return FinalSend::Done;
                 }
                 attempt = attempt.saturating_add(1);
                 let wait = backoff_fn(attempt);
@@ -278,9 +311,97 @@ pub(super) async fn send_final_with_retry(
                 );
                 tokio::select! {
                     biased;
-                    _ = shutdown.cancelled() => return Ok(()),
+                    _ = shutdown.cancelled() => return FinalSend::Done,
                     _ = tokio::time::sleep(wait) => {}
                 }
+            }
+        }
+    }
+}
+
+/// Send a pre-split multi-part final reply in order, one part at a time.
+///
+/// `cli_session_id` rides only on the last part so the Hub persists it once.
+/// A part rejected deterministically is logged and retried exactly once more as
+/// two half-sized sub-parts (a bounded, one-level degradation); the loop then
+/// continues with the remaining parts. Nothing here propagates an error, so a
+/// single bad part can never drop the rest of the reply.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn send_final_parts(
+    sender: &dyn Transport,
+    parts: Vec<String>,
+    ctx: &str,
+    to_user: &str,
+    session_name: &str,
+    cli_session: Option<String>,
+    usage: Option<serde_json::Value>,
+    backoff_fn: fn(u32) -> Duration,
+    max_total: Duration,
+    shutdown: &CancellationToken,
+) {
+    let total = parts.len();
+    for (i, part) in parts.into_iter().enumerate() {
+        let is_last = i + 1 == total;
+        let reply = OutboundReply {
+            context_token: ctx.to_string(),
+            text: part.clone(),
+            to_user: to_user.to_string(),
+            cli_session_id: if is_last { cli_session.clone() } else { None },
+            session_name: Some(session_name.to_string()),
+            a2a_call_id: None,
+            usage: usage.clone(),
+        };
+        let FinalSend::Rejected { ret, errmsg } = send_final_with_retry(
+            sender,
+            reply,
+            backoff_fn,
+            max_total,
+            shutdown,
+            "final reply",
+        )
+        .await
+        else {
+            continue;
+        };
+        warn!(
+            ret,
+            part_chars = part.chars().count(),
+            errmsg = sanitize_errmsg(errmsg.as_deref()).as_deref(),
+            "final reply part rejected deterministically; degrading to half-sized sub-parts"
+        );
+        let halved = part.chars().count() / 2;
+        if halved == 0 {
+            continue;
+        }
+        let sub_parts = split_into_parts(&part, halved);
+        if sub_parts.len() <= 1 {
+            continue;
+        }
+        for sub in sub_parts {
+            let sub_reply = OutboundReply {
+                context_token: ctx.to_string(),
+                text: sub,
+                to_user: to_user.to_string(),
+                cli_session_id: None,
+                session_name: Some(session_name.to_string()),
+                a2a_call_id: None,
+                usage: usage.clone(),
+            };
+            if let FinalSend::Rejected { ret, errmsg } = send_final_with_retry(
+                sender,
+                sub_reply,
+                backoff_fn,
+                max_total,
+                shutdown,
+                "final reply (degraded)",
+            )
+            .await
+            {
+                warn!(
+                    ret,
+                    errmsg = sanitize_errmsg(errmsg.as_deref()).as_deref(),
+                    "degraded sub-part rejected deterministically; dropping it"
+                );
             }
         }
     }

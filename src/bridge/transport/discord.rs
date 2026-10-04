@@ -9,8 +9,8 @@
 //! Discord Gateway 文档：
 //! <https://discord.com/developers/docs/events/gateway>
 
-use std::sync::Arc;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -525,9 +525,7 @@ impl DiscordTransport {
                     .ok()
                     .filter(|s| !s.trim().is_empty())
             })
-            .context(
-                "transport: discord 需要 im_credentials.token 或环境变量 DISCORD_BOT_TOKEN",
-            )?;
+            .context("transport: discord 需要 im_credentials.token 或环境变量 DISCORD_BOT_TOKEN")?;
         Self::new(token)
     }
 
@@ -602,6 +600,15 @@ impl Transport for DiscordTransport {
                     errmsg: Some("rate limited".to_string()),
                 });
             }
+            // 400 (code 50035 "Invalid Form Body", over the 2000-char cap) and
+            // 413 (payload too large) are deterministic: never retry.
+            if status.is_client_error() {
+                let body = resp.text().await.unwrap_or_default();
+                return Ok(SendOutcome::Rejected {
+                    ret: status.as_u16() as i32,
+                    errmsg: Some(body),
+                });
+            }
             if !status.is_success() {
                 let body = resp.text().await.unwrap_or_default();
                 anyhow::bail!("Discord sendMessage HTTP {status}: {body}");
@@ -668,7 +675,10 @@ impl Transport for DiscordTransport {
     }
 
     fn capabilities(&self) -> TransportCapabilities {
-        TransportCapabilities { media_upload: true }
+        TransportCapabilities {
+            media_upload: true,
+            max_text_len: Some(2000),
+        }
     }
 }
 
@@ -759,8 +769,12 @@ mod send_media_tests {
 
     #[test]
     fn capabilities_reports_media_upload_true() {
-        let cap = TransportCapabilities { media_upload: true };
+        let cap = TransportCapabilities {
+            media_upload: true,
+            max_text_len: Some(2000),
+        };
         assert!(cap.media_upload);
+        assert_eq!(cap.max_text_len, Some(2000));
     }
 }
 
@@ -856,6 +870,32 @@ mod send_media_e2e_tests {
         };
         let err = t.send_media(ctx, media_payload()).await.unwrap_err();
         assert!(format!("{err:#}").contains("HTTP 500"));
+        m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn send_reply_400_invalid_form_body_returns_rejected() {
+        let mut server = mockito::Server::new_async().await;
+        let m = server
+            .mock("POST", "/channels/C123/messages")
+            .with_status(400)
+            .with_body(r#"{"code":50035,"message":"Invalid Form Body"}"#)
+            .create_async()
+            .await;
+        let t = transport_for(server.url());
+        let reply = OutboundReply {
+            context_token: "C123".into(),
+            text: "x".repeat(2500),
+            ..Default::default()
+        };
+        let outcome = t.send_reply(reply).await.expect("sendMessage rejected");
+        match outcome {
+            SendOutcome::Rejected { ret, errmsg } => {
+                assert_eq!(ret, 400);
+                assert!(errmsg.unwrap_or_default().contains("Invalid Form Body"));
+            }
+            other => panic!("expected Rejected, got {other:?}"),
+        }
         m.assert_async().await;
     }
 }
