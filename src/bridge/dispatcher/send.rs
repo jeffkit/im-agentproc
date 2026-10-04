@@ -377,12 +377,14 @@ pub(super) async fn send_final_parts(
         if sub_parts.len() <= 1 {
             continue;
         }
-        for sub in sub_parts {
+        let sub_total = sub_parts.len();
+        for (j, sub) in sub_parts.into_iter().enumerate() {
+            let last_sub = is_last && j + 1 == sub_total;
             let sub_reply = OutboundReply {
                 context_token: ctx.to_string(),
                 text: sub,
                 to_user: to_user.to_string(),
-                cli_session_id: None,
+                cli_session_id: if last_sub { cli_session.clone() } else { None },
                 session_name: Some(session_name.to_string()),
                 a2a_call_id: None,
                 usage: usage.clone(),

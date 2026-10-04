@@ -45,6 +45,11 @@ Versions follow [Semantic Versioning](https://semver.org/).
   `send_text` / `send_image` / `send_file` / `send_voice` calls (#4).
   Credential keys (`IM_AGENTPROC_MCP_TRANSPORT`, the per-transport secrets,
   `IM_AGENTPROC_MCP_ILINK_*`) are still forwarded from the bridge process env.
+- The degraded sub-parts of a deterministically rejected final part no longer
+  drop `cli_session_id` for the whole turn: the last sub-part actually delivered
+  carries it, so the Hub still persists the CLI session id and the next message
+  resumes the same session (previously every sub-part was sent with
+  `cli_session_id: None`, silently breaking session continuity for that turn).
 
 ### Breaking
 
