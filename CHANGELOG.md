@@ -6,6 +6,17 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Fatal-auth classification narrowed to full phrases.** `AUTH_ERROR_KEYWORDS`
+  no longer matches the bare words `token` / `auth` / `401` / `login`, and the
+  dispatcher no longer treats `not found` / `no such file` as credential
+  failures. A single message carrying `max_tokens`, `tokens exceeded`,
+  `model not found`, `tool not found` or `404 not found` used to be fatal and
+  exited the whole bridge process, interrupting every session on that profile.
+- The `Fatal` decision is now made by the single predicate
+  `bridge::is_fatal_auth_error()`; `probe.rs` classification reuses it.
+
 ## [0.3.0] - 2026-09-16
 
 ### Added

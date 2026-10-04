@@ -1,8 +1,8 @@
 use anyhow::Result;
 
 use crate::bridge::config::BridgeProfile;
+use crate::bridge::is_fatal_auth_error;
 use crate::bridge::paths::find_in_path;
-use crate::bridge::AUTH_ERROR_KEYWORDS;
 use crate::paths::expand_user_path;
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, Clone, thiserror::Error)]
@@ -256,8 +256,8 @@ pub async fn dry_run_profile(profile: &BridgeProfile, message: &str) -> Result<S
     let stderr_str = String::from_utf8_lossy(&output.stderr).into_owned();
 
     if !output.status.success() {
-        let all_output = format!("{}\n{}", stdout_str, stderr_str).to_lowercase();
-        if AUTH_ERROR_KEYWORDS.iter().any(|&k| all_output.contains(k)) {
+        let all_output = format!("{}\n{}", stdout_str, stderr_str);
+        if is_fatal_auth_error(&all_output) {
             return Err(ProbeError::Unauthenticated(format!(
                 "exit code: {:?}\n--- stderr ---\n{}\n--- stdout ---\n{}",
                 output.status.code(),

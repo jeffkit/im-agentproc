@@ -467,7 +467,11 @@ mod tests {
 
         let out = normalize_attachment("file", &url, None, None, None, dir.path())
             .expect("existing absolute file:// URL is kept");
-        assert!(out.url.starts_with("file://"), "stays absolute: {}", out.url);
+        assert!(
+            out.url.starts_with("file://"),
+            "stays absolute: {}",
+            out.url
+        );
 
         let back = Url::parse(&out.url)
             .expect("normalised url parses")
@@ -503,7 +507,10 @@ mod tests {
 
         let url = Url::from_file_path(&missing).unwrap().to_string();
         let out = normalize_attachment("file", &url, None, None, None, dir.path());
-        assert!(out.is_none(), "missing file:// attachment must be dropped: {out:?}");
+        assert!(
+            out.is_none(),
+            "missing file:// attachment must be dropped: {out:?}"
+        );
     }
 
     #[test]

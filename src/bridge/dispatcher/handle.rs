@@ -8,9 +8,9 @@ use tracing::{error, info, warn};
 
 use crate::bridge::config::BridgeApp;
 use crate::bridge::executor::split_into_parts;
+use crate::bridge::is_fatal_auth_error;
 use crate::bridge::protocol::Attachment;
 use crate::bridge::transport::{InboundMessage, MediaRef, OutboundReply, Transport};
-use crate::bridge::AUTH_ERROR_KEYWORDS;
 
 use super::backoff::{backoff_for, retry_budget};
 use super::send::{sanitize_field, send_final_with_retry};
@@ -314,11 +314,7 @@ pub(super) async fn handle_one_message(
                     warn!(error = %send_e, "failed to send error reply")
                 }
             }
-            let err_str = e.to_string().to_lowercase();
-            if AUTH_ERROR_KEYWORDS.iter().any(|&k| err_str.contains(k))
-                || err_str.contains("not found")
-                || err_str.contains("no such file")
-            {
+            if is_fatal_auth_error(&e.to_string()) {
                 return Err(HandleError::Fatal(BridgeStop::FatalCliError(e.to_string())));
             }
             return Err(HandleError::Transient(e));

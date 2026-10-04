@@ -29,19 +29,70 @@ pub use transport::connection::{
     validate_hub_token,
 };
 
-/// Keywords in CLI stderr that indicate an auth/credential problem.
-/// When any of these appear in the error output, the bridge treats the failure as fatal.
+/// Full phrases that identify a credential failure on their own (no bare words:
+/// `token` also matches `max_tokens`, `auth` also matches `author`). Everything
+/// matched here stops the whole bridge process, so only unambiguous wording counts.
 pub const AUTH_ERROR_KEYWORDS: &[&str] = &[
-    "login",
-    "logout",
-    "auth",
-    "credential",
-    "sign in",
+    "not logged in",
+    "invalid api key",
+    "incorrect api key",
+    "missing api key",
     "unauthorized",
     "unauthenticated",
-    "401",
-    "not logged in",
+    "authentication failed",
+    "authentication required",
+    "authentication error",
+    "invalid credentials",
+    "credentials expired",
+    "sign in",
     "keychain",
-    "api key",
-    "token",
 ];
+
+/// True when the CLI's error text names a *credential* failure. The text is
+/// normally produced by the model or an upstream service, so only full phrases count.
+pub fn is_fatal_auth_error(cli_error_text: &str) -> bool {
+    let text = cli_error_text.to_lowercase();
+    AUTH_ERROR_KEYWORDS.iter().any(|k| text.contains(k))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn llm_side_errors_are_not_auth_failures() {
+        for text in [
+            "API error: max_tokens(4096) reached",
+            "context tokens exceeded (200001 > 200000)",
+            "model not found: claude-nonexistent-9",
+            "tool not found: mcp__demo__missing",
+            "upstream responded 404 not found",
+            "no such file or directory",
+            "output_tokens limit",
+        ] {
+            assert!(
+                !is_fatal_auth_error(text),
+                "{text:?} is not an auth failure"
+            );
+        }
+    }
+
+    #[test]
+    fn genuine_credential_failures_are_fatal() {
+        for text in [
+            "invalid api key provided",
+            "not logged in: run `login` first",
+            "401 unauthorized",
+        ] {
+            assert!(is_fatal_auth_error(text), "{text:?} must be fatal");
+        }
+    }
+
+    #[test]
+    fn overbroad_short_keywords_are_gone() {
+        assert!(!AUTH_ERROR_KEYWORDS.iter().any(|k| matches!(
+            *k,
+            "token" | "auth" | "401" | "login" | "logout" | "credential"
+        )));
+    }
+}
