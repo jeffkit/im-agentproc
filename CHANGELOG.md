@@ -6,8 +6,37 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Channel text limit in `TransportCapabilities`.** `max_text_len: Option<usize>`
+  (`None` = the adapter declares no client-visible cap). Telegram declares
+  `4096`, Discord `2000`; ilink / wecom / feishu declare `None`.
+- **`SendOutcome::Rejected { ret, errmsg }`** for deterministic platform
+  rejections, so the dispatcher can tell them apart from retryable throttles.
+
+### Changed
+
+- Long replies are split by `min(profile.max_reply_chars, transport.max_text_len)`
+  instead of the profile cap alone, so an 8000-char body no longer overruns the
+  Telegram (4096) / Discord (2000) channel limit.
+- A deterministically rejected part is no longer retried against the 60-300s
+  backoff budget: it is dropped immediately, degraded once into half-sized
+  sub-parts, and the remaining parts are still delivered (previously the whole
+  remainder of the reply was lost behind a dead `?`).
+- Telegram 4xx `sendMessage` errors, Discord client errors (400 code 50035 /
+  413) and Feishu `99991400` (message too long, previously mapped to
+  `Throttled`) now surface as `SendOutcome::Rejected`.
+
 ### Fixed
 
+- **Fatal-auth classification narrowed to full phrases.** `AUTH_ERROR_KEYWORDS`
+  no longer matches the bare words `token` / `auth` / `401` / `login`, and the
+  dispatcher no longer treats `not found` / `no such file` as credential
+  failures. A single message carrying `max_tokens`, `tokens exceeded`,
+  `model not found`, `tool not found` or `404 not found` used to be fatal and
+  exited the whole bridge process, interrupting every session on that profile.
+- The `Fatal` decision is now made by the single predicate
+  `bridge::is_fatal_auth_error()`; `probe.rs` classification reuses it.
 - **Per-turn MCP conversation context.** The bridge no longer reads
   `IM_AGENTPROC_MCP_CONTEXT_TOKEN` / `IM_AGENTPROC_MCP_TO_USER` from its own
   process environment. `mcp_extra_env_for_profile()` now takes the current
@@ -16,6 +45,13 @@ Versions follow [Semantic Versioning](https://semver.org/).
   `send_text` / `send_image` / `send_file` / `send_voice` calls (#4).
   Credential keys (`IM_AGENTPROC_MCP_TRANSPORT`, the per-transport secrets,
   `IM_AGENTPROC_MCP_ILINK_*`) are still forwarded from the bridge process env.
+
+### Breaking
+
+- `TransportCapabilities` gained the `max_text_len` field and `SendOutcome`
+  gained the `Rejected` variant. Downstream crates that build
+  `TransportCapabilities` with a struct literal or exhaustively `match` on
+  `SendOutcome` must be updated (`Default` still covers `::default()`).
 
 ## [0.3.0] - 2026-09-16
 
