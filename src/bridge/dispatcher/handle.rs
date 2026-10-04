@@ -7,13 +7,13 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use crate::bridge::config::BridgeApp;
-use crate::bridge::executor::split_into_parts;
+use crate::bridge::executor::{effective_chunk_chars, split_into_parts};
 use crate::bridge::is_fatal_auth_error;
 use crate::bridge::protocol::Attachment;
 use crate::bridge::transport::{InboundMessage, MediaRef, OutboundReply, Transport};
 
 use super::backoff::{backoff_for, retry_budget};
-use super::send::{sanitize_field, send_final_with_retry};
+use super::send::{sanitize_field, send_final_parts, send_final_with_retry, FinalSend};
 use super::session::HandleError;
 use super::BridgeStop;
 
@@ -202,7 +202,7 @@ pub(super) async fn handle_one_message(
                             a2a_call_id,
                             usage: summary.usage.clone(),
                         };
-                        if let Err(e) = send_final_with_retry(
+                        if let FinalSend::Rejected { ret, errmsg } = send_final_with_retry(
                             &**client,
                             reply,
                             backoff_for,
@@ -212,7 +212,11 @@ pub(super) async fn handle_one_message(
                         )
                         .await
                         {
-                            warn!(error = %e, "failed to persist cli_session_id after partial-only reply")
+                            warn!(
+                                ret,
+                                errmsg = super::send::sanitize_errmsg(errmsg.as_deref()).as_deref(),
+                                "failed to persist cli_session_id after partial-only reply: rejected deterministically"
+                            )
                         }
                     }
                 }
@@ -230,7 +234,7 @@ pub(super) async fn handle_one_message(
                     a2a_call_id,
                     usage: summary.usage.clone(),
                 };
-                send_final_with_retry(
+                if let FinalSend::Rejected { ret, errmsg } = send_final_with_retry(
                     &**client,
                     reply,
                     backoff_for,
@@ -239,46 +243,47 @@ pub(super) async fn handle_one_message(
                     "a2a final reply",
                 )
                 .await
-                .map_err(|e| HandleError::from(e.context("sendmessage a2a reply")))?;
+                {
+                    warn!(
+                        ret,
+                        errmsg = super::send::sanitize_errmsg(errmsg.as_deref()).as_deref(),
+                        "a2a final reply rejected deterministically"
+                    );
+                }
                 return Ok(());
             }
             // Split long replies into multiple messages instead of truncating.
-            let parts = split_into_parts(&effective_body, profile.max_reply_chars);
+            // The chunk size is min(profile.max_reply_chars, transport channel
+            // text limit), so a 8000-char profile cap can never overrun a
+            // 4096/2000-char channel.
+            let caps = client.capabilities();
+            let chunk_chars = effective_chunk_chars(profile.max_reply_chars, caps.max_text_len);
+            let parts = split_into_parts(&effective_body, chunk_chars);
             let total = parts.len();
             info!(
                 profile = profile_name,
                 session_name = %session_name_for_cli,
                 reply_parts = total,
+                chunk_chars,
                 body_bytes = summary.body_bytes,
                 partial_count = summary.partial_count,
                 duration_ms = summary.duration_ms,
                 error_event = summary.error_event,
                 "message handled: final reply sent"
             );
-            for (i, part) in parts.into_iter().enumerate() {
-                let is_last = i + 1 == total;
-                // cli_session_id is attached only to the last part so it is persisted once.
-                let session_id = if is_last { cli_session.clone() } else { None };
-                let reply = OutboundReply {
-                    context_token: ctx.clone(),
-                    text: part,
-                    to_user: from_user.clone(),
-                    cli_session_id: session_id,
-                    session_name: Some(session_name_for_cli.clone()),
-                    a2a_call_id: None,
-                    usage: summary.usage.clone(),
-                };
-                send_final_with_retry(
-                    &**client,
-                    reply,
-                    backoff_for,
-                    retry_budget,
-                    &shutdown,
-                    "final reply",
-                )
-                .await
-                .map_err(|e| HandleError::from(e.context("sendmessage reply")))?;
-            }
+            send_final_parts(
+                &**client,
+                parts,
+                &ctx,
+                &from_user,
+                &session_name_for_cli,
+                cli_session.clone(),
+                summary.usage.clone(),
+                backoff_for,
+                retry_budget,
+                &shutdown,
+            )
+            .await;
         }
         Err(e) => {
             error!(error = %e, "CLI failed; sending error reply to user");
@@ -301,7 +306,7 @@ pub(super) async fn handle_one_message(
                 // per-call `retry_budget` still bounds the total
                 // wall-clock time spent here, and `main()` will abort
                 // the task after its 3 s grace period if needed.
-                if let Err(send_e) = send_final_with_retry(
+                if let FinalSend::Rejected { ret, errmsg } = send_final_with_retry(
                     &**client,
                     reply,
                     backoff_for,
@@ -311,7 +316,11 @@ pub(super) async fn handle_one_message(
                 )
                 .await
                 {
-                    warn!(error = %send_e, "failed to send error reply")
+                    warn!(
+                        ret,
+                        errmsg = super::send::sanitize_errmsg(errmsg.as_deref()).as_deref(),
+                        "failed to send error reply: rejected deterministically"
+                    )
                 }
             }
             if is_fatal_auth_error(&e.to_string()) {

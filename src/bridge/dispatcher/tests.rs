@@ -1,9 +1,11 @@
 use super::handle::handle_one_message;
 use super::{
-    backoff_for, backoff_for_test, run_partial_forward_loop, sanitize_errmsg,
-    send_final_with_retry, session_dispatch_key, BridgeStop, SessionDispatcher, MAX_BACKOFF_SECS,
+    backoff_for, backoff_for_test, run_partial_forward_loop, sanitize_errmsg, send_final_parts,
+    send_final_with_retry, session_dispatch_key, BridgeStop, FinalSend, SessionDispatcher,
+    MAX_BACKOFF_SECS,
 };
 use crate::bridge::config::BridgeApp;
+use crate::bridge::executor::{effective_chunk_chars, split_into_parts};
 use crate::bridge::transport::ilink::{parse_sendoutcome, IlinkTransport};
 use crate::bridge::transport::{
     InboundMessage, OutboundReply, SendOutcome, Transport, TransportCapabilities,
@@ -491,6 +493,7 @@ struct ScriptedSender {
     log: Arc<Mutex<Vec<String>>>,
     timestamps: Arc<Mutex<Vec<Instant>>>,
     loop_outcome: Arc<Mutex<Option<SendOutcome>>>,
+    caps: TransportCapabilities,
 }
 
 impl ScriptedSender {
@@ -500,6 +503,7 @@ impl ScriptedSender {
             log: Arc::new(Mutex::new(Vec::new())),
             timestamps: Arc::new(Mutex::new(Vec::new())),
             loop_outcome: Arc::new(Mutex::new(None)),
+            caps: TransportCapabilities::default(),
         }
     }
 
@@ -513,7 +517,13 @@ impl ScriptedSender {
             log: Arc::new(Mutex::new(Vec::new())),
             timestamps: Arc::new(Mutex::new(Vec::new())),
             loop_outcome: Arc::new(Mutex::new(Some(outcome))),
+            caps: TransportCapabilities::default(),
         }
+    }
+
+    fn with_capabilities(mut self, caps: TransportCapabilities) -> Self {
+        self.caps = caps;
+        self
     }
 
     fn sent_count(&self) -> usize {
@@ -562,7 +572,7 @@ impl Transport for ScriptedSender {
     }
 
     fn capabilities(&self) -> TransportCapabilities {
-        TransportCapabilities::default()
+        self.caps.clone()
     }
 }
 
@@ -1000,6 +1010,36 @@ async fn partial_err_drops_buffer_and_continues_serving_new_chunks() {
 }
 
 #[tokio::test]
+async fn partial_rejected_drops_buffer_and_continues() {
+    // A deterministic rejection must behave like Err: drop the
+    // buffered chunk immediately (no backoff budget burned) and keep
+    // serving new chunks.
+    let scripted = ScriptedSender::new(vec![
+        Ok(SendOutcome::Rejected {
+            ret: 400,
+            errmsg: Some("too long".into()),
+        }),
+        Ok(SendOutcome::Sent),
+    ]);
+    let (tx, _shutdown, handle) = spawn_test_loop(Arc::new(scripted.clone()));
+    let probe = scripted.clone();
+
+    tx.send(Some("first".into())).unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    tx.send(Some("second".into())).unwrap();
+    for _ in 0..200 {
+        if probe.sent_count() >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    drop(tx);
+    handle.await.unwrap();
+
+    assert_eq!(probe.sent_texts(), vec!["first", "second"]);
+}
+
+#[tokio::test]
 async fn partial_shutdown_during_backoff_exits_cleanly() {
     // While a backoff is sleeping, a shutdown signal must wake the
     // loop and let it return. The buffered chunk is dropped (it
@@ -1099,7 +1139,7 @@ fn dummy_reply() -> OutboundReply {
 async fn final_reply_throttled_thrice_then_delivered() {
     // E2E-2 scenario C/D: the final reply is throttled N times then
     // lands. The retry helper must keep resending the same payload
-    // until Sent and return Ok exactly once delivered.
+    // until Sent and return Done exactly once delivered.
     let scripted = ScriptedSender::new(vec![
         Ok(SendOutcome::Throttled {
             ret: -2,
@@ -1125,7 +1165,10 @@ async fn final_reply_throttled_thrice_then_delivered() {
         "final reply",
     )
     .await;
-    assert!(res.is_ok(), "delivery after retries must return Ok");
+    assert!(
+        matches!(res, FinalSend::Done),
+        "delivery after retries must return Done"
+    );
     assert_eq!(
         scripted.sent_count(),
         4,
@@ -1155,8 +1198,8 @@ async fn final_reply_transport_error_retried_then_succeeds() {
     )
     .await;
     assert!(
-        res.is_ok(),
-        "transport errors retried until success must return Ok"
+        matches!(res, FinalSend::Done),
+        "transport errors retried until success must return Done"
     );
     assert_eq!(
         scripted.sent_count(),
@@ -1184,8 +1227,8 @@ async fn final_reply_transport_error_budget_exhausted_gives_up() {
     )
     .await;
     assert!(
-        res.is_ok(),
-        "budget-exhausted transport error must give up with Ok, not propagate Err"
+        matches!(res, FinalSend::Done),
+        "budget-exhausted transport error must give up with Done, not propagate Err"
     );
     assert_eq!(
         scripted.sent_count(),
@@ -1218,12 +1261,11 @@ async fn final_reply_persistent_throttle_gives_up_within_budget() {
     )
     .await;
     assert!(
-        res.is_ok(),
-        "helper must return within the timeout (no infinite spin under persistent throttle)"
-    );
-    assert!(
-        res.unwrap().is_ok(),
-        "give-up returns Ok so the caller continues cleanly"
+        matches!(
+            res.expect("helper must return within the timeout"),
+            FinalSend::Done
+        ),
+        "give-up returns Done so the caller continues cleanly"
     );
     assert!(
         scripted.sent_count() >= 1,
@@ -1234,7 +1276,7 @@ async fn final_reply_persistent_throttle_gives_up_within_budget() {
 #[tokio::test]
 async fn final_reply_shutdown_during_backoff_returns_promptly() {
     // Cancel-safety: a shutdown during the backoff sleep aborts the
-    // retry loop and returns Ok without hanging.
+    // retry loop and returns Done without hanging.
     let scripted = ScriptedSender::new_loop(SendOutcome::Throttled {
         ret: -2,
         errmsg: None,
@@ -1257,7 +1299,7 @@ async fn final_reply_shutdown_during_backoff_returns_promptly() {
     shutdown.cancel();
     let res = tokio::time::timeout(Duration::from_secs(2), task).await;
     assert!(res.is_ok(), "task must finish promptly after shutdown");
-    assert!(res.unwrap().unwrap().is_ok());
+    assert!(matches!(res.unwrap().unwrap(), FinalSend::Done));
     let _ = probe.sent_count();
 }
 
@@ -1368,4 +1410,107 @@ async fn repro_e2e_codebuddy_block_on() {
     let client: Arc<dyn Transport> = Arc::new(ScriptedSender::new_loop(SendOutcome::Sent));
     let msg = make_msg("ctx-repro-1", "default");
     let _ = handle_one_message(&client, &app, msg, CancellationToken::new()).await;
+}
+
+// ─── issue #8: channel text limits + deterministic rejection ──────
+
+#[tokio::test(start_paused = true)]
+async fn final_rejected_is_attempted_once_and_not_retried() {
+    // One scripted outcome only: if the helper retried a deterministic
+    // rejection, `record_and_next` would panic on script exhaustion.
+    let scripted = ScriptedSender::new(vec![Ok(SendOutcome::Rejected {
+        ret: 400,
+        errmsg: Some("too long".into()),
+    })]);
+    let shutdown = CancellationToken::new();
+    let res = send_final_with_retry(
+        &scripted,
+        dummy_reply(),
+        test_backoff,
+        Duration::from_secs(3600),
+        &shutdown,
+        "final reply",
+    )
+    .await;
+    match res {
+        FinalSend::Rejected { ret, errmsg } => {
+            assert_eq!(ret, 400);
+            assert_eq!(errmsg.as_deref(), Some("too long"));
+        }
+        other => panic!("expected Rejected, got {other:?}"),
+    }
+    assert_eq!(scripted.sent_count(), 1, "rejection must not be retried");
+}
+
+#[tokio::test(start_paused = true)]
+async fn final_parts_rejected_first_still_delivers_rest() {
+    // First part length 1 → too short to degrade, so the script only
+    // needs one outcome for the rejection plus one for the second part.
+    let scripted = ScriptedSender::new(vec![
+        Ok(SendOutcome::Rejected {
+            ret: 400,
+            errmsg: Some("too long".into()),
+        }),
+        Ok(SendOutcome::Sent),
+    ]);
+    let shutdown = CancellationToken::new();
+    send_final_parts(
+        &scripted,
+        vec!["A".into(), "B".into()],
+        "ctx",
+        "user",
+        "sess",
+        None,
+        None,
+        test_backoff,
+        Duration::from_secs(3600),
+        &shutdown,
+    )
+    .await;
+    assert_eq!(scripted.sent_texts(), vec!["A", "B"]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn final_parts_split_by_channel_limit() {
+    let scripted = ScriptedSender::new(vec![
+        Ok(SendOutcome::Sent),
+        Ok(SendOutcome::Sent),
+        Ok(SendOutcome::Sent),
+    ])
+    .with_capabilities(TransportCapabilities {
+        media_upload: true,
+        max_text_len: Some(4096),
+    });
+    let sender: Arc<dyn Transport> = Arc::new(scripted.clone());
+    let body = "x".repeat(9000);
+    let chunk_chars = effective_chunk_chars(8000, sender.capabilities().max_text_len);
+    assert_eq!(chunk_chars, 4096);
+    let parts = split_into_parts(&body, chunk_chars);
+    send_final_parts(
+        &scripted,
+        parts,
+        "ctx",
+        "user",
+        "sess",
+        None,
+        None,
+        test_backoff,
+        Duration::from_secs(3600),
+        &CancellationToken::new(),
+    )
+    .await;
+    let texts = scripted.sent_texts();
+    assert_eq!(
+        texts.len(),
+        3,
+        "9000 chars must split into 3 parts: {texts:?}"
+    );
+    for t in &texts {
+        assert!(
+            t.chars().count() <= 4096,
+            "part over channel cap: {}",
+            t.len()
+        );
+    }
+    assert_eq!(texts.concat(), body);
 }

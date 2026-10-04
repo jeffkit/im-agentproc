@@ -411,6 +411,14 @@ impl TelegramTransport {
                     errmsg: Some(desc.to_string()),
                 });
             }
+            // 400 covers "Bad Request: message is too long" (the 4096-char
+            // cap) and other bad-parameter errors: deterministic, never retry.
+            if (400..500).contains(&code) {
+                return Ok(SendOutcome::Rejected {
+                    ret: code as i32,
+                    errmsg: Some(desc.to_string()),
+                });
+            }
             anyhow::bail!("Telegram sendMessage error {code}: {desc}");
         }
         Ok(SendOutcome::Sent)
@@ -530,7 +538,10 @@ impl Transport for TelegramTransport {
     }
 
     fn capabilities(&self) -> TransportCapabilities {
-        TransportCapabilities { media_upload: true }
+        TransportCapabilities {
+            media_upload: true,
+            max_text_len: Some(4096),
+        }
     }
 }
 
@@ -665,6 +676,34 @@ mod send_media_e2e_tests {
         };
         let err = t.send_media(ctx, png_media("x.png")).await.unwrap_err();
         assert!(format!("{err:#}").contains("HTTP 500"));
+        m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn send_reply_400_too_long_returns_rejected() {
+        let mut server = mockito::Server::new_async().await;
+        let m = server
+            .mock("POST", "/bot123:abc/sendMessage")
+            .with_status(200)
+            .with_body(
+                r#"{"ok":false,"error_code":400,"description":"Bad Request: message is too long"}"#,
+            )
+            .create_async()
+            .await;
+        let t = transport_for(server.url());
+        let reply = OutboundReply {
+            context_token: "123".into(),
+            text: "x".repeat(5000),
+            ..Default::default()
+        };
+        let outcome = t.send_reply(reply).await.expect("sendMessage rejected");
+        match outcome {
+            SendOutcome::Rejected { ret, errmsg } => {
+                assert_eq!(ret, 400);
+                assert!(errmsg.unwrap_or_default().contains("too long"));
+            }
+            other => panic!("expected Rejected, got {other:?}"),
+        }
         m.assert_async().await;
     }
 }

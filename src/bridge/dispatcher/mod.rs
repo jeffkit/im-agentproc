@@ -18,7 +18,9 @@ use session::SessionDispatcher;
 #[cfg(test)]
 use backoff::{backoff_for, backoff_for_test, MAX_BACKOFF_SECS};
 #[cfg(test)]
-use send::{run_partial_forward_loop, sanitize_errmsg, send_final_with_retry};
+use send::{
+    run_partial_forward_loop, sanitize_errmsg, send_final_parts, send_final_with_retry, FinalSend,
+};
 #[cfg(test)]
 use session::session_dispatch_key;
 

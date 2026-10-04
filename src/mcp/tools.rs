@@ -117,13 +117,16 @@ impl OutboundDelivery {
             Ok(SendOutcome::Throttled { ret, errmsg }) => crate::mcp::server::failure_text(
                 errmsg.unwrap_or_else(|| format!("throttled (code={ret})")),
             ),
+            Ok(SendOutcome::Rejected { ret, errmsg }) => crate::mcp::server::failure_text(
+                errmsg.unwrap_or_else(|| format!("rejected (code={ret})")),
+            ),
             Err(err) => crate::mcp::server::failure_text(format!("{err:#}")),
         }
     }
 
     pub async fn send_text(&self, text: String, reply_to: Option<String>) -> Value {
         // Reuse `Transport::send_reply` so the transport-specific outbound
-        // path (Telegram HTML fallback, Feishu 99991400 throttle mapping, …)
+        // path (Telegram error mapping, Feishu 99991400 rejection, …)
         // applies uniformly.
         let reply = OutboundReply {
             context_token: self.context_token.clone(),
@@ -139,6 +142,9 @@ impl OutboundDelivery {
             Ok(SendOutcome::Sent) => crate::mcp::server::success_empty(),
             Ok(SendOutcome::Throttled { ret, errmsg }) => crate::mcp::server::failure_text(
                 errmsg.unwrap_or_else(|| format!("throttled (code={ret})")),
+            ),
+            Ok(SendOutcome::Rejected { ret, errmsg }) => crate::mcp::server::failure_text(
+                errmsg.unwrap_or_else(|| format!("rejected (code={ret})")),
             ),
             Err(err) => crate::mcp::server::failure_text(format!("{err:#}")),
         }
@@ -414,7 +420,10 @@ mod tests {
                 text: Arc::new(Mutex::new(Vec::new())),
                 media: Arc::new(Mutex::new(Vec::new())),
                 name,
-                capabilities: TransportCapabilities { media_upload },
+                capabilities: TransportCapabilities {
+                    media_upload,
+                    max_text_len: None,
+                },
             }
         }
     }

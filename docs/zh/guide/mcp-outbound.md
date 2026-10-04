@@ -128,6 +128,7 @@ agent 只看到 success 信封。用户看到图表。
 | `read local media file <path>: No such file` | `file://` URL 指向 bridge 访问不到的路径（agent 跑在别的机器上）。改用 `data:` 或 `https:` |
 | IM API 返回 HTTP 401 / 403 | IM 凭据（`im_credentials.*` 或环境变量回退）缺失或过期 |
 | `throttled (code=429)` | IM 限流了上传。MCP server 以 `isError: true` 暴露，agent 可以退避 |
+| `rejected (code=...)` | IM 确定性拒绝了这次发送——最常见是文本超过通道上限（Telegram 4096 / Discord 2000）。不会重试；MCP server 返回 `isError: true` |
 
 ## 参考
 

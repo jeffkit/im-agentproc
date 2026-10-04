@@ -6,6 +6,27 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Channel text limit in `TransportCapabilities`.** `max_text_len: Option<usize>`
+  (`None` = the adapter declares no client-visible cap). Telegram declares
+  `4096`, Discord `2000`; ilink / wecom / feishu declare `None`.
+- **`SendOutcome::Rejected { ret, errmsg }`** for deterministic platform
+  rejections, so the dispatcher can tell them apart from retryable throttles.
+
+### Changed
+
+- Long replies are split by `min(profile.max_reply_chars, transport.max_text_len)`
+  instead of the profile cap alone, so an 8000-char body no longer overruns the
+  Telegram (4096) / Discord (2000) channel limit.
+- A deterministically rejected part is no longer retried against the 60-300s
+  backoff budget: it is dropped immediately, degraded once into half-sized
+  sub-parts, and the remaining parts are still delivered (previously the whole
+  remainder of the reply was lost behind a dead `?`).
+- Telegram 4xx `sendMessage` errors, Discord client errors (400 code 50035 /
+  413) and Feishu `99991400` (message too long, previously mapped to
+  `Throttled`) now surface as `SendOutcome::Rejected`.
+
 ### Fixed
 
 - **Fatal-auth classification narrowed to full phrases.** `AUTH_ERROR_KEYWORDS`
@@ -16,6 +37,13 @@ Versions follow [Semantic Versioning](https://semver.org/).
   exited the whole bridge process, interrupting every session on that profile.
 - The `Fatal` decision is now made by the single predicate
   `bridge::is_fatal_auth_error()`; `probe.rs` classification reuses it.
+
+### Breaking
+
+- `TransportCapabilities` gained the `max_text_len` field and `SendOutcome`
+  gained the `Rejected` variant. Downstream crates that build
+  `TransportCapabilities` with a struct literal or exhaustively `match` on
+  `SendOutcome` must be updated (`Default` still covers `::default()`).
 
 ## [0.3.0] - 2026-09-16
 

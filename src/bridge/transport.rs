@@ -99,6 +99,9 @@ pub enum SendOutcome {
     Sent,
     /// The IM signalled throttling / rate-limit; retry with backoff.
     Throttled { ret: i32, errmsg: Option<String> },
+    /// Deterministic platform rejection (message too long / bad parameter).
+    /// Callers must NOT retry this as a transient error.
+    Rejected { ret: i32, errmsg: Option<String> },
 }
 
 /// One media attachment on an inbound message, or to attach to an outbound reply.
@@ -184,6 +187,11 @@ pub struct OutboundReply {
 pub struct TransportCapabilities {
     /// Whether the transport can upload media for outbound replies.
     pub media_upload: bool,
+    /// Max text length the IM accepts in one message, when the transport knows
+    /// it. `None` = the adapter declares no client-visible cap (or has no
+    /// server receipt to observe one), so the dispatcher falls back to the
+    /// profile's `max_reply_chars` alone.
+    pub max_text_len: Option<usize>,
 }
 
 /// Context for an outbound media send — the minimal routing info an adapter
@@ -334,7 +342,10 @@ mod tests {
         }
 
         fn capabilities(&self) -> TransportCapabilities {
-            TransportCapabilities { media_upload: true }
+            TransportCapabilities {
+                media_upload: true,
+                max_text_len: None,
+            }
         }
     }
 

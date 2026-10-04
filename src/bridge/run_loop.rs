@@ -90,6 +90,7 @@ impl BridgeRunOptions {
         info!(
             transport = ctx.kind.as_str(),
             media_upload = caps.media_upload,
+            max_text_len = ?caps.max_text_len,
             "transport built"
         );
         Ok(t)
