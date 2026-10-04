@@ -103,7 +103,10 @@ impl Transport for FakeIm {
     }
 
     fn capabilities(&self) -> TransportCapabilities {
-        TransportCapabilities { media_upload: true }
+        TransportCapabilities {
+            media_upload: true,
+            max_text_len: None,
+        }
     }
 }
 
