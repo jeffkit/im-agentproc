@@ -27,6 +27,14 @@ Versions follow [Semantic Versioning](https://semver.org/).
   413) and Feishu `99991400` (message too long, previously mapped to
   `Throttled`) now surface as `SendOutcome::Rejected`.
 
+### Fixed
+
+- The degraded sub-parts of a deterministically rejected final part no longer
+  drop `cli_session_id` for the whole turn: the last sub-part actually delivered
+  carries it, so the Hub still persists the CLI session id and the next message
+  resumes the same session (previously every sub-part was sent with
+  `cli_session_id: None`, silently breaking session continuity for that turn).
+
 ### Breaking
 
 - `TransportCapabilities` gained the `max_text_len` field and `SendOutcome`

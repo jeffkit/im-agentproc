@@ -492,6 +492,8 @@ struct ScriptedSender {
     script: Arc<Mutex<Vec<Result<SendOutcome>>>>,
     log: Arc<Mutex<Vec<String>>>,
     timestamps: Arc<Mutex<Vec<Instant>>>,
+    replies: Arc<Mutex<Vec<OutboundReply>>>,
+    delivered: Arc<Mutex<Vec<bool>>>,
     loop_outcome: Arc<Mutex<Option<SendOutcome>>>,
     caps: TransportCapabilities,
 }
@@ -502,6 +504,8 @@ impl ScriptedSender {
             script: Arc::new(Mutex::new(script)),
             log: Arc::new(Mutex::new(Vec::new())),
             timestamps: Arc::new(Mutex::new(Vec::new())),
+            replies: Arc::new(Mutex::new(Vec::new())),
+            delivered: Arc::new(Mutex::new(Vec::new())),
             loop_outcome: Arc::new(Mutex::new(None)),
             caps: TransportCapabilities::default(),
         }
@@ -516,6 +520,8 @@ impl ScriptedSender {
             script: Arc::new(Mutex::new(Vec::new())),
             log: Arc::new(Mutex::new(Vec::new())),
             timestamps: Arc::new(Mutex::new(Vec::new())),
+            replies: Arc::new(Mutex::new(Vec::new())),
+            delivered: Arc::new(Mutex::new(Vec::new())),
             loop_outcome: Arc::new(Mutex::new(Some(outcome))),
             caps: TransportCapabilities::default(),
         }
@@ -536,6 +542,31 @@ impl ScriptedSender {
 
     fn sent_timestamps(&self) -> Vec<Instant> {
         self.timestamps.lock().unwrap().clone()
+    }
+
+    /// `cli_session_id` per `send_reply` attempt, aligned with
+    /// [`Self::sent_texts`] (both record every attempt, including
+    /// rejected ones).
+    fn sent_cli_sessions(&self) -> Vec<Option<String>> {
+        self.replies
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|r| r.cli_session_id.clone())
+            .collect()
+    }
+
+    /// Same as [`Self::sent_cli_sessions`] but only for attempts the
+    /// transport actually accepted — the messages the Hub ever sees.
+    fn delivered_cli_sessions(&self) -> Vec<Option<String>> {
+        let replies = self.replies.lock().unwrap();
+        let delivered = self.delivered.lock().unwrap();
+        replies
+            .iter()
+            .zip(delivered.iter())
+            .filter(|(_, ok)| **ok)
+            .map(|(r, _)| r.cli_session_id.clone())
+            .collect()
     }
 
     /// Record one send (label + timestamp) and pop the next scripted
@@ -567,7 +598,12 @@ impl Transport for ScriptedSender {
     }
 
     fn send_reply<'a>(&'a self, reply: OutboundReply) -> BoxFuture<'a, Result<SendOutcome>> {
+        self.replies.lock().unwrap().push(reply.clone());
         let next = self.record_and_next(reply.text);
+        self.delivered
+            .lock()
+            .unwrap()
+            .push(matches!(next, Ok(SendOutcome::Sent)));
         Box::pin(async move { next })
     }
 
@@ -1459,4 +1495,122 @@ async fn final_parts_split_by_channel_limit() {
         );
     }
     assert_eq!(texts.concat(), body);
+}
+
+#[tokio::test(start_paused = true)]
+async fn final_parts_degraded_last_part_carries_cli_session() {
+    // "A" is delivered as-is; the last part "BBBB" is rejected
+    // deterministically and re-sent as two halves. The degraded
+    // sub-parts are this turn's final deliveries, so the session id
+    // must ride on the last of them — otherwise the Hub never
+    // persists it and the next turn starts a cold CLI session.
+    let scripted = ScriptedSender::new(vec![
+        Ok(SendOutcome::Sent),
+        Ok(SendOutcome::Rejected {
+            ret: 400,
+            errmsg: Some("too long".into()),
+        }),
+        Ok(SendOutcome::Sent),
+        Ok(SendOutcome::Sent),
+    ]);
+    send_final_parts(
+        &scripted,
+        vec!["A".into(), "BBBB".into()],
+        "ctx",
+        "user",
+        "sess",
+        Some("sess-1".into()),
+        None,
+        test_backoff,
+        Duration::from_secs(3600),
+        &CancellationToken::new(),
+    )
+    .await;
+    assert_eq!(scripted.sent_texts(), vec!["A", "BBBB", "BB", "BB"]);
+    // Per attempt: the rejected "BBBB" attempt already carried the id
+    // (it simply never reached the Hub), the sub-parts did not until
+    // the last one.
+    assert_eq!(
+        scripted.sent_cli_sessions(),
+        vec![None, Some("sess-1".into()), None, Some("sess-1".into())]
+    );
+    assert_eq!(
+        scripted.delivered_cli_sessions(),
+        vec![None, None, Some("sess-1".into())],
+        "exactly the last delivered sub-part carries the session id"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn final_parts_degraded_non_last_part_keeps_cli_session_off_subparts() {
+    // A non-last part is degraded: its sub-parts must NOT carry the
+    // session id (no early/duplicate propagation), and the following
+    // part must still be delivered with the session id attached.
+    let scripted = ScriptedSender::new(vec![
+        Ok(SendOutcome::Rejected {
+            ret: 400,
+            errmsg: Some("too long".into()),
+        }),
+        Ok(SendOutcome::Sent),
+        Ok(SendOutcome::Sent),
+        Ok(SendOutcome::Sent),
+    ]);
+    send_final_parts(
+        &scripted,
+        vec!["AAAA".into(), "B".into()],
+        "ctx",
+        "user",
+        "sess",
+        Some("sess-1".into()),
+        None,
+        test_backoff,
+        Duration::from_secs(3600),
+        &CancellationToken::new(),
+    )
+    .await;
+    assert_eq!(scripted.sent_texts(), vec!["AAAA", "AA", "AA", "B"]);
+    assert_eq!(
+        scripted.delivered_cli_sessions(),
+        vec![None, None, Some("sess-1".into())],
+        "degraded sub-parts of a non-last part stay session-less"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn final_parts_degraded_subpart_rejected_does_not_reattach_cli_session() {
+    // The last sub-part is itself rejected: it is dropped (no second
+    // halving, no re-send), so no extra delivery happens and nothing
+    // is re-attached to an already-delivered sub-part.
+    let scripted = ScriptedSender::new(vec![
+        Ok(SendOutcome::Sent),
+        Ok(SendOutcome::Rejected {
+            ret: 400,
+            errmsg: Some("too long".into()),
+        }),
+        Ok(SendOutcome::Sent),
+        Ok(SendOutcome::Rejected {
+            ret: 400,
+            errmsg: Some("too long".into()),
+        }),
+    ]);
+    send_final_parts(
+        &scripted,
+        vec!["A".into(), "BBBB".into()],
+        "ctx",
+        "user",
+        "sess",
+        Some("sess-1".into()),
+        None,
+        test_backoff,
+        Duration::from_secs(3600),
+        &CancellationToken::new(),
+    )
+    .await;
+    assert_eq!(scripted.sent_texts(), vec!["A", "BBBB", "BB", "BB"]);
+    assert_eq!(
+        scripted.delivered_cli_sessions(),
+        vec![None, None],
+        "no re-send and no re-attach: the already-delivered first sub-part \
+         keeps no session id when the last sub-part is itself rejected"
+    );
 }
