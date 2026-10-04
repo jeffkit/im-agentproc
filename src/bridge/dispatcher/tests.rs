@@ -1315,3 +1315,218 @@ async fn repro_e2e_codebuddy_block_on() {
     let msg = make_msg("ctx-repro-1", "default");
     let _ = handle_one_message(&client, &app, msg, CancellationToken::new()).await;
 }
+
+// ─── [wip] issue #6: delivery semantics ─────────────────────────────
+//
+// The acceptance criteria of issue #6 that can only be exercised through the
+// `pub(super)` dispatcher seams (`send_final_with_retry`, `SessionDispatcher`).
+// The end-to-end equivalents live in `tests/[wip]_issue6_delivery.rs`.
+//
+// These tests FAIL on the current tree (they pin behaviour that does not exist
+// yet). Note that `final_reply_transport_error_budget_exhausted_gives_up` and
+// `final_reply_persistent_throttle_gives_up_within_budget` above pin the OLD
+// contract (`Ok` on give-up) and must be inverted by the same fix.
+
+/// Transport whose first `send_reply` parks until [`GatedSender::release`];
+/// every later send returns `Sent` immediately. Lets a test hold the session
+/// worker busy while it floods the queue.
+#[derive(Clone)]
+struct GatedSender {
+    attempts: Arc<std::sync::atomic::AtomicUsize>,
+    gate: Arc<tokio::sync::Semaphore>,
+}
+
+impl GatedSender {
+    fn new() -> Self {
+        Self {
+            attempts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            gate: Arc::new(tokio::sync::Semaphore::new(0)),
+        }
+    }
+
+    fn attempts(&self) -> usize {
+        self.attempts.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn release(&self) {
+        self.gate.add_permits(1);
+    }
+}
+
+impl Transport for GatedSender {
+    fn next_inbound<'a>(
+        &'a self,
+        _buf: &'a mut String,
+    ) -> BoxFuture<'a, Result<crate::bridge::transport::InboundOutcome>> {
+        Box::pin(async { Ok(crate::bridge::transport::InboundOutcome::Messages(vec![])) })
+    }
+
+    fn send_reply<'a>(&'a self, _reply: OutboundReply) -> BoxFuture<'a, Result<SendOutcome>> {
+        let n = self.attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let gate = self.gate.clone();
+        Box::pin(async move {
+            if n == 0 {
+                let _ = gate.acquire().await;
+            }
+            Ok(SendOutcome::Sent)
+        })
+    }
+
+    fn capabilities(&self) -> TransportCapabilities {
+        TransportCapabilities::default()
+    }
+}
+
+/// Write a deterministic agentproc 0.4 handler so every dispatched message
+/// produces a non-empty reply body.
+fn write_wip_handler(dir: &std::path::Path) -> std::path::PathBuf {
+    let path = dir.join("handler.sh");
+    std::fs::write(
+        &path,
+        "#!/usr/bin/env bash\ncat >/dev/null\nprintf '%s\\n' '{\"type\":\"result\",\"text\":\"ok\"}'\n",
+    )
+    .expect("write handler");
+    path
+}
+
+fn make_wip_app(handler: &std::path::Path) -> BridgeApp {
+    BridgeApp::parse_yaml(
+        &format!(
+            "script: {}\nagentproc:\n  timeout_secs: 20\n  streaming: false\n",
+            handler.display()
+        ),
+        "wip-issue6".to_string(),
+    )
+    .expect("parse bridge profile")
+}
+
+/// Acceptance 3 (throttle branch): a final reply whose retry budget is
+/// exhausted under a persistent throttle must NOT be reported as delivered.
+#[tokio::test]
+async fn wip_final_reply_persistent_throttle_exhaustion_is_reported_as_undelivered() {
+    let scripted = ScriptedSender::new_loop(SendOutcome::Throttled {
+        ret: -2,
+        errmsg: Some("rate limited".into()),
+    });
+    let shutdown = CancellationToken::new();
+    let res = tokio::time::timeout(
+        Duration::from_secs(5),
+        send_final_with_retry(
+            &scripted,
+            dummy_reply(),
+            test_backoff,
+            Duration::from_millis(30),
+            &shutdown,
+            "final reply",
+        ),
+    )
+    .await
+    .expect("helper must return within the timeout");
+    assert!(
+        scripted.sent_count() >= 1,
+        "expected at least one send attempt before the budget expired"
+    );
+    assert!(
+        res.is_err(),
+        "[wip] issue #6 acceptance 3: an abandoned final reply must not be reported as success \
+         (`return Ok(())` at send.rs:237) — it must return Err / be marked undelivered and enter \
+         the make-up/report path; got {res:?}"
+    );
+}
+
+/// Acceptance 3 (transport-error branch): same for a permanent transport error.
+#[tokio::test]
+async fn wip_final_reply_transport_error_exhaustion_is_reported_as_undelivered() {
+    let scripted = ScriptedSender::new(vec![Err(anyhow::anyhow!("connection reset"))]);
+    let shutdown = CancellationToken::new();
+    // Duration::ZERO: the budget check fires immediately after the first
+    // failure, so this pins the give-up path without sleeping.
+    let res = send_final_with_retry(
+        &scripted,
+        dummy_reply(),
+        test_backoff,
+        Duration::ZERO,
+        &shutdown,
+        "final reply",
+    )
+    .await;
+    assert_eq!(
+        scripted.sent_count(),
+        1,
+        "exactly one attempt before the budget expired"
+    );
+    assert!(
+        res.is_err(),
+        "[wip] issue #6 acceptance 3: an abandoned final reply must not be reported as success \
+         (`return Ok(())` at send.rs:267) — it must return Err / be marked undelivered and enter \
+         the make-up/report path; got {res:?}"
+    );
+}
+
+/// Acceptance 2: when the session worker is busy, messages that overflow
+/// `DEFAULT_SESSION_QUEUE_SIZE` take the `try_send(Full)` path
+/// (session.rs:220). They must not be silently dropped: either re-injected
+/// (WAL) once the worker drains, or surfaced as an explicit failure.
+#[tokio::test]
+async fn wip_session_queue_overflow_is_not_silently_dropped() {
+    const QUEUE: usize = 200; // DEFAULT_SESSION_QUEUE_SIZE
+    let total = QUEUE + 5; // 1 parked + 200 buffered + 4 overflowed
+
+    let wal_dir = tempfile::tempdir().expect("tempdir");
+    let handler_dir = tempfile::tempdir().expect("tempdir");
+    let handler = write_wip_handler(handler_dir.path());
+    // Keep the WAL out of the developer's real home directory.
+    std::env::set_var("IM_AGENTPROC_WAL_DIR", wal_dir.path());
+
+    let sender = GatedSender::new();
+    let disp = SessionDispatcher::new(
+        Arc::new(sender.clone()),
+        Arc::new(make_wip_app(&handler)),
+        make_stop_tx(),
+        CancellationToken::new(),
+    );
+
+    // Message #1 reaches the parked send, holding the worker busy.
+    disp.dispatch(make_msg("ctx-q", "default")).await;
+    for _ in 0..1000 {
+        if sender.attempts() == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        sender.attempts(),
+        1,
+        "worker must be parked in its first send_reply"
+    );
+
+    // Flood the same session key: QUEUE messages fit, the rest overflow.
+    for _ in 0..(total - 1) {
+        disp.dispatch(make_msg("ctx-q", "default")).await;
+    }
+    assert_eq!(
+        sender.attempts(),
+        1,
+        "worker must still be parked while the queue is full"
+    );
+
+    sender.release();
+
+    let mut delivered = 0;
+    for _ in 0..3000 {
+        delivered = sender.attempts();
+        if delivered >= total {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    std::env::remove_var("IM_AGENTPROC_WAL_DIR");
+
+    assert!(
+        delivered >= total,
+        "[wip] issue #6 acceptance 2: only {delivered} of {total} messages were answered — the \
+         {QUEUE}+ messages overflowing the session queue were silently dropped \
+         (session.rs:220 `warn!(\"session queue full, dropping message\")`); they must enter the \
+         WAL and be re-injected once the worker drains, or be surfaced as an explicit failure"
+    );
+}
