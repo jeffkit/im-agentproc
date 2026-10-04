@@ -160,7 +160,7 @@ pub(super) async fn handle_one_message(
         &from_user,
         &ap_attachments,
         partial_tx,
-        mcp_extra_env_for_profile(profile),
+        mcp_extra_env_for_profile(&ctx, &from_user),
     )
     .await;
 
@@ -357,25 +357,26 @@ fn log_message_handled_success(
     }
 }
 
-/// Collect `IM_AGENTPROC_MCP_*` env vars from the bridge process environment
-/// so they can be forwarded to the hub profile child via
-/// [`agentproc::RunOptions::extra_env`].
+/// Build the `IM_AGENTPROC_MCP_*` env map forwarded to the hub profile child
+/// via [`agentproc::RunOptions::extra_env`] — the highest-priority layer, so
+/// it overrides same-named keys in the profile's own `env:` block.
 ///
-/// Today the hub profile child is responsible for spawning its own
+/// Credential-ish keys (`TRANSPORT`, the per-transport secrets,
+/// `ILINK_HUB_URL`, `ILINK_TOKEN`) can only come from the bridge process
+/// environment, so they are forwarded verbatim. Conversation context is
+/// per-turn: `context_token` / `to_user` are *this* inbound message's values,
+/// and they overwrite any stale process-env entry — a bridge serves many
+/// conversations, so a process-wide token would cross-deliver replies.
+///
+/// The hub profile child is responsible for spawning its own
 /// `im-agentproc mcp-server` subprocess (see
-/// `docs/guide/mcp-outbound.md`); the bridge just forwards the env so the
-/// child sees the same transport + context that the bridge did. Future
-/// revisions may move the spawn inside the bridge itself and pass stdio
-/// pipes via `_STDOUT_FD` / `_STDIN_FD` keys — see the inline notes in
-/// `agentproc_runner.rs`.
-fn mcp_extra_env_for_profile(
-    _profile: &crate::bridge::config::BridgeProfile,
-) -> HashMap<String, String> {
+/// `docs/guide/mcp-outbound.md`). Future revisions may move the spawn inside
+/// the bridge itself and pass stdio pipes via `_STDOUT_FD` / `_STDIN_FD` keys
+/// — see the inline notes in `agentproc_runner.rs`.
+fn mcp_extra_env_for_profile(context_token: &str, to_user: &str) -> HashMap<String, String> {
     let keys = [
         "IM_AGENTPROC_MCP_AUTOSTART",
         "IM_AGENTPROC_MCP_TRANSPORT",
-        "IM_AGENTPROC_MCP_CONTEXT_TOKEN",
-        "IM_AGENTPROC_MCP_TO_USER",
         "IM_AGENTPROC_MCP_TELEGRAM_TOKEN",
         "IM_AGENTPROC_MCP_FEISHU_APP_ID",
         "IM_AGENTPROC_MCP_FEISHU_APP_SECRET",
@@ -393,6 +394,15 @@ fn mcp_extra_env_for_profile(
             }
         }
     }
+    if !context_token.trim().is_empty() {
+        out.insert(
+            "IM_AGENTPROC_MCP_CONTEXT_TOKEN".to_string(),
+            context_token.to_string(),
+        );
+    }
+    if !to_user.trim().is_empty() {
+        out.insert("IM_AGENTPROC_MCP_TO_USER".to_string(), to_user.to_string());
+    }
     out
 }
 
@@ -404,8 +414,8 @@ mod mcp_extra_env_tests {
     // mutex so concurrent test runs don't race.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// Wipe every `IM_AGENTPROC_MCP_*` env var the helper looks at, so
-    /// the empty-env test isn't polluted by other tests setting one.
+    /// Wipe every `IM_AGENTPROC_MCP_*` env var the helper looks at, so the
+    /// process-env half of the assertions isn't polluted by other tests.
     fn clear_mcp_env() {
         let keys = [
             "IM_AGENTPROC_MCP_AUTOSTART",
@@ -430,10 +440,18 @@ mod mcp_extra_env_tests {
     }
 
     #[test]
-    fn empty_env_produces_empty_map() {
+    fn per_turn_context_survives_empty_process_env() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         clear_mcp_env();
-        assert!(mcp_extra_env_for_profile(&Default::default()).is_empty());
+        let out = mcp_extra_env_for_profile("ctx-a", "user-a");
+        let expected: HashMap<String, String> = [
+            ("IM_AGENTPROC_MCP_CONTEXT_TOKEN", "ctx-a"),
+            ("IM_AGENTPROC_MCP_TO_USER", "user-a"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        assert_eq!(out, expected);
     }
 
     #[test]
@@ -443,26 +461,95 @@ mod mcp_extra_env_tests {
         // SAFETY: serialised by ENV_LOCK.
         unsafe {
             std::env::set_var("IM_AGENTPROC_MCP_TRANSPORT", "feishu");
-            std::env::set_var("IM_AGENTPROC_MCP_CONTEXT_TOKEN", "oc_x");
             std::env::set_var("IM_AGENTPROC_MCP_FEISHU_APP_ID", "cli_y");
+            // Stale process-wide token, as an operator would export it once.
+            std::env::set_var("IM_AGENTPROC_MCP_CONTEXT_TOKEN", "oc_x");
         }
-        let out = mcp_extra_env_for_profile(&Default::default());
+        let out = mcp_extra_env_for_profile("ctx-this-turn", "user-this-turn");
         clear_mcp_env();
         assert_eq!(
             out.get("IM_AGENTPROC_MCP_TRANSPORT").map(String::as_str),
             Some("feishu")
         );
         assert_eq!(
-            out.get("IM_AGENTPROC_MCP_CONTEXT_TOKEN")
-                .map(String::as_str),
-            Some("oc_x")
-        );
-        assert_eq!(
             out.get("IM_AGENTPROC_MCP_FEISHU_APP_ID")
                 .map(String::as_str),
             Some("cli_y")
         );
+        // The process-env token is overwritten by this turn's inbound value.
+        assert_eq!(
+            out.get("IM_AGENTPROC_MCP_CONTEXT_TOKEN")
+                .map(String::as_str),
+            Some("ctx-this-turn")
+        );
+        assert_eq!(
+            out.get("IM_AGENTPROC_MCP_TO_USER").map(String::as_str),
+            Some("user-this-turn")
+        );
         // unset vars do not appear
         assert!(!out.contains_key("IM_AGENTPROC_MCP_TELEGRAM_TOKEN"));
+    }
+
+    #[test]
+    fn two_turns_get_distinct_tokens() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_mcp_env();
+        let a = mcp_extra_env_for_profile("ctx-a", "user-of-ctx-a");
+        let b = mcp_extra_env_for_profile("ctx-b", "user-of-ctx-b");
+        assert_eq!(
+            a.get("IM_AGENTPROC_MCP_CONTEXT_TOKEN").map(String::as_str),
+            Some("ctx-a")
+        );
+        assert_eq!(
+            b.get("IM_AGENTPROC_MCP_CONTEXT_TOKEN").map(String::as_str),
+            Some("ctx-b")
+        );
+        assert_ne!(
+            a.get("IM_AGENTPROC_MCP_CONTEXT_TOKEN"),
+            b.get("IM_AGENTPROC_MCP_CONTEXT_TOKEN")
+        );
+        assert_eq!(
+            a.get("IM_AGENTPROC_MCP_TO_USER").map(String::as_str),
+            Some("user-of-ctx-a")
+        );
+        assert_eq!(
+            b.get("IM_AGENTPROC_MCP_TO_USER").map(String::as_str),
+            Some("user-of-ctx-b")
+        );
+    }
+
+    #[test]
+    fn stale_process_env_token_is_overridden() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_mcp_env();
+        // SAFETY: serialised by ENV_LOCK.
+        unsafe {
+            std::env::set_var("IM_AGENTPROC_MCP_CONTEXT_TOKEN", "operator-exported-once");
+            std::env::set_var("IM_AGENTPROC_MCP_TO_USER", "operator-exported-user");
+        }
+        let out = mcp_extra_env_for_profile("ctx-b", "user-of-ctx-b");
+        clear_mcp_env();
+        assert_eq!(
+            out.get("IM_AGENTPROC_MCP_CONTEXT_TOKEN")
+                .map(String::as_str),
+            Some("ctx-b")
+        );
+        assert_eq!(
+            out.get("IM_AGENTPROC_MCP_TO_USER").map(String::as_str),
+            Some("user-of-ctx-b")
+        );
+    }
+
+    #[test]
+    fn empty_to_user_omits_key() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_mcp_env();
+        let out = mcp_extra_env_for_profile("ctx-a", "");
+        assert_eq!(
+            out.get("IM_AGENTPROC_MCP_CONTEXT_TOKEN")
+                .map(String::as_str),
+            Some("ctx-a")
+        );
+        assert!(!out.contains_key("IM_AGENTPROC_MCP_TO_USER"));
     }
 }

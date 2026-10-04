@@ -23,12 +23,9 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use tracing::info;
 
-
 use im_agentproc::bridge::transport::registry::{TransportBuildCtx, TransportRegistry};
 use im_agentproc::bridge::transport::Transport;
-use im_agentproc::bridge::{
-    builtin, BridgeApp, Via,
-};
+use im_agentproc::bridge::{builtin, BridgeApp, Via};
 use im_agentproc::mcp::{
     run_server, OutboundDelivery, SendFileTool, SendImageTool, SendTextTool, SendVoiceTool,
     ServerConfig, ToolRegistry,
@@ -124,14 +121,16 @@ enum Commands {
     /// (`send_text` / `send_image` / `send_file` / `send_voice`) to a hub
     /// profile child process.
     ///
-    /// The bridge manager launches this sub-process with a transport and
-    /// inbound context already resolved; the sub-process reads
-    /// `IM_AGENTPROC_MCP_*` env vars to discover what to serve.
+    /// The profile CLI child spawns this sub-process; the bridge dispatcher
+    /// injects the **current turn's** `context_token` / `to_user` into that
+    /// child via `agentproc::RunOptions::extra_env`, and the child inherits
+    /// them here. Credential keys (`IM_AGENTPROC_MCP_TRANSPORT`,
+    /// `IM_AGENTPROC_MCP_*_TOKEN`, …) come from the bridge process env.
     ///
-    /// Example:
+    /// Example (credentials from the bridge env; context is injected per turn
+    /// by the dispatcher, so it is not exported by hand):
     ///   IM_AGENTPROC_MCP_TRANSPORT=feishu \
-    ///   IM_AGENTPROC_MCP_CONTEXT_TOKEN=oc_xxx \
-    ///   IM_AGENTPROC_MCP_TO_USER=user_1 \
+    ///   IM_AGENTPROC_MCP_FEISHU_APP_ID=cli_xxx \
     ///   im-agentproc mcp-server
     McpServer,
     /// Discover profile YAML files and supervise one bridge workspace per file.
@@ -171,11 +170,11 @@ fn explicit_token(cli: &Cli) -> Option<&str> {
 
 use im_agentproc::bridge::transport::registry::DEFAULT_HUB_URL;
 
-
 /// Launch the outbound-media MCP stdio server as a sub-process entrypoint.
 ///
-/// The bridge manager launches this sub-process after resolving the
-/// transport + inbound context. We read those from env vars here.
+/// The profile CLI child launches this sub-process; the bridge dispatcher has
+/// already resolved the transport and injects this turn's inbound context as
+/// env vars. We read both from the environment here.
 async fn run_mcp_server() -> Result<()> {
     use std::sync::Arc;
 
@@ -469,13 +468,6 @@ mod tests {
         assert!(!cli.no_interactive);
     }
 
-
-
-
-
-
-
-
     // ── resolve_mcp_transport env-var wiring ─────────────────────────────────
     // We serialise on the same ENV_LOCK + clear_im_credential_env helper used
     // by the factory tests so concurrent runs can't race on env reads.
@@ -559,6 +551,4 @@ mod tests {
         assert_eq!(transport.name(), "discord");
         assert!(transport.capabilities().media_upload);
     }
-
-
 }

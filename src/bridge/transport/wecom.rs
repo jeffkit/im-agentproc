@@ -11,8 +11,8 @@
 //! 参考文档：
 //! <https://developer.work.weixin.qq.com/document/path/101463>
 
-use std::sync::Arc;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};

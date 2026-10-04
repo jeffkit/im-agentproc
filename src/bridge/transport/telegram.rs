@@ -13,8 +13,8 @@
 //! Media handling: photos, documents, audio, video and voice messages are
 //! downloaded to temp files and forwarded as `MediaRef` attachments.
 
-use std::time::Duration;
 use std::collections::HashMap;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use futures_util::future::BoxFuture;
