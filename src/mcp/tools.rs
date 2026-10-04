@@ -68,11 +68,14 @@ impl ToolRegistry {
 pub struct OutboundDelivery {
     pub transport: Arc<dyn Transport>,
     /// `context_token` from the inbound message (chat_id / channel_id /
-    /// req_id). The MCP server is per-bridge-child, so this is set once at
-    /// bridge startup and reused on every tool call.
+    /// req_id). The bridge injects it as `IM_AGENTPROC_MCP_CONTEXT_TOKEN` into
+    /// the profile child's env for **each turn**, and `im-agentproc mcp-server`
+    /// reads it once at startup — one agentproc run per turn spawns a fresh CLI
+    /// child, so each mcp-server process serves exactly one turn's context and
+    /// every tool call on it routes back to that turn's conversation.
     pub context_token: String,
-    /// Optional `to_user` override; defaults to the inbound `from_user` when
-    /// the bridge has one. The MCP server fills this in at bridge startup.
+    /// `to_user` from the inbound message, injected per turn alongside
+    /// `context_token`; empty when the transport has no `from_user`.
     pub to_user: String,
 }
 
@@ -406,9 +409,10 @@ mod tests {
     use futures_util::future::BoxFuture;
     use std::sync::Mutex;
 
-    /// Test transport that records every send_reply/send_media invocation.
+    /// Test transport that records every send_reply/send_media invocation,
+    /// keyed by the `context_token` it was asked to deliver to.
     struct CapturingTransport {
-        text: Arc<Mutex<Vec<String>>>,
+        text: Arc<Mutex<Vec<(String, String)>>>,
         media: Arc<Mutex<Vec<(MediaRef, MediaOut)>>>,
         name: &'static str,
         capabilities: TransportCapabilities,
@@ -441,7 +445,7 @@ mod tests {
         ) -> BoxFuture<'a, anyhow::Result<SendOutcome>> {
             let text = self.text.clone();
             Box::pin(async move {
-                text.lock().unwrap().push(reply.text);
+                text.lock().unwrap().push((reply.context_token, reply.text));
                 Ok(SendOutcome::Sent)
             })
         }
@@ -489,7 +493,10 @@ mod tests {
             assert_eq!(v["isError"], false);
             assert_eq!(v["content"].as_array().unwrap().len(), 0);
         });
-        assert_eq!(*tr.text.lock().unwrap(), vec!["hello world".to_string()]);
+        assert_eq!(
+            *tr.text.lock().unwrap(),
+            vec![("chat-1".to_string(), "hello world".to_string())]
+        );
     }
 
     #[test]
@@ -672,5 +679,68 @@ mod tests {
         r.register(Arc::new(SendTextTool { delivery }));
         assert!(r.get("send_text").is_some());
         assert!(r.get("nonexistent").is_none());
+    }
+
+    #[test]
+    fn concurrent_deliveries_do_not_cross_context_tokens() {
+        let tr_a = Arc::new(CapturingTransport::new("telegram", true));
+        let tr_b = Arc::new(CapturingTransport::new("telegram", true));
+        let delivery_a = Arc::new(OutboundDelivery::new(
+            tr_a.clone(),
+            "chat-a".into(),
+            "user-a".into(),
+        ));
+        let delivery_b = Arc::new(OutboundDelivery::new(
+            tr_b.clone(),
+            "chat-b".into(),
+            "user-b".into(),
+        ));
+        let a_text = SendTextTool {
+            delivery: delivery_a.clone(),
+        };
+        let a_image = SendImageTool {
+            delivery: delivery_a,
+        };
+        let b_text = SendTextTool {
+            delivery: delivery_b.clone(),
+        };
+        let b_image = SendImageTool {
+            delivery: delivery_b,
+        };
+
+        let rt = runtime();
+        rt.block_on(async {
+            let (a_text_v, a_image_v, b_text_v, b_image_v) = tokio::join!(
+                a_text.call(json!({"text": "hi-a"})),
+                a_image.call(json!({"source": {"uri": "file:///tmp/a.png"}})),
+                b_text.call(json!({"text": "hi-b"})),
+                b_image.call(json!({"source": {"uri": "file:///tmp/b.png"}})),
+            );
+            for v in [a_text_v, a_image_v, b_text_v, b_image_v] {
+                assert_eq!(v.expect("call")["isError"], false);
+            }
+        });
+
+        let a_texts = tr_a.text.lock().unwrap().clone();
+        assert_eq!(a_texts, vec![("chat-a".to_string(), "hi-a".to_string())]);
+        let a_media = tr_a.media.lock().unwrap().clone();
+        assert_eq!(a_media.len(), 1);
+        assert_eq!(a_media[0].1.context_token, "chat-a");
+
+        let b_texts = tr_b.text.lock().unwrap().clone();
+        assert_eq!(b_texts, vec![("chat-b".to_string(), "hi-b".to_string())]);
+        let b_media = tr_b.media.lock().unwrap().clone();
+        assert_eq!(b_media.len(), 1);
+        assert_eq!(b_media[0].1.context_token, "chat-b");
+
+        // No cross-talk: A's transport never saw B's token and vice versa.
+        assert!(!a_texts.iter().any(|(ctx, _)| ctx.contains("chat-b")));
+        assert!(!b_texts.iter().any(|(ctx, _)| ctx.contains("chat-a")));
+        assert!(!a_media
+            .iter()
+            .any(|(_, out)| out.context_token.contains("chat-b")));
+        assert!(!b_media
+            .iter()
+            .any(|(_, out)| out.context_token.contains("chat-a")));
     }
 }

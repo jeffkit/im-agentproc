@@ -29,6 +29,22 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Fatal-auth classification narrowed to full phrases.** `AUTH_ERROR_KEYWORDS`
+  no longer matches the bare words `token` / `auth` / `401` / `login`, and the
+  dispatcher no longer treats `not found` / `no such file` as credential
+  failures. A single message carrying `max_tokens`, `tokens exceeded`,
+  `model not found`, `tool not found` or `404 not found` used to be fatal and
+  exited the whole bridge process, interrupting every session on that profile.
+- The `Fatal` decision is now made by the single predicate
+  `bridge::is_fatal_auth_error()`; `probe.rs` classification reuses it.
+- **Per-turn MCP conversation context.** The bridge no longer reads
+  `IM_AGENTPROC_MCP_CONTEXT_TOKEN` / `IM_AGENTPROC_MCP_TO_USER` from its own
+  process environment. `mcp_extra_env_for_profile()` now takes the current
+  inbound message's `context_token` / `from_user` and overwrites both keys on
+  every turn, so concurrent conversations can no longer cross-deliver outbound
+  `send_text` / `send_image` / `send_file` / `send_voice` calls (#4).
+  Credential keys (`IM_AGENTPROC_MCP_TRANSPORT`, the per-transport secrets,
+  `IM_AGENTPROC_MCP_ILINK_*`) are still forwarded from the bridge process env.
 - The degraded sub-parts of a deterministically rejected final part no longer
   drop `cli_session_id` for the whole turn: the last sub-part actually delivered
   carries it, so the Hub still persists the CLI session id and the next message

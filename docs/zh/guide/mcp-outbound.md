@@ -22,8 +22,8 @@ bridge 的出站路径通过 stdio JSON-RPC 2.0 server 暴露成四个 MCP 工�
 ## profile 配置
 
 在 profile YAML 里加 `mcp_servers` 块。CLI 不同，shape 也不同，但
-bridge 侧的契约是：bridge 自己跑一个 stdio MCP server，CLI 子进程
-attach 上去。
+bridge 侧的契约是：profile CLI 子进程自行拉起 `im-agentproc mcp-server`
+作为 stdio 子进程，bridge 把本轮会话上下文注入该子进程的 env。
 
 ```yaml
 # ~/.im-agentproc/telegram-claude.yaml
@@ -35,14 +35,57 @@ agentproc:
   executor: claude-code
   mcp_servers:
     - name: im-agentproc
-      # bridge 进程是父进程；CLI 子进程通过 build_transport 注入的
-      # 环境变量找到它。按 SDK 调整。
-      command: ${IM_AGENTPROC_MCP_BRIDGE}
+      # profile CLI 子进程自行拉起这个子进程；它继承 bridge 为本轮
+      # 注入的 env。按 SDK 调整 shape。
+      command: im-agentproc
       args: ["mcp-server"]
 ```
 
-bridge 二进制的 `mcp-server` 子命令就是 `crate::mcp::run_server`
-针对当前 bridge 的 transport 和入站会话上下文的入口。
+`im-agentproc mcp-server` 就是 `crate::mcp::run_server` 的入口：它针对
+`IM_AGENTPROC_MCP_TRANSPORT` 指的 transport，以及 bridge 为**当前这一轮**
+注入的会话上下文提供服务。
+
+## 每轮上下文注入
+
+每条入站消息触发一次 profile 运行，每次运行前，bridge dispatcher
+（`bridge/dispatcher/handle.rs` 的 `mcp_extra_env_for_profile()`）组装**本轮**
+的 `IM_AGENTPROC_MCP_*` map，经 `agentproc::RunOptions::extra_env` 交给
+profile 子进程。`extra_env` 是优先级最高的一层，会覆盖 profile `env:` 里的
+同名键，profile 子进程继承结果。
+
+键分两组：
+
+**会话上下文 —— 由 bridge 注入，运维不要手动 export。**
+
+| 键 | 本轮取值 |
+|---|---|
+| `IM_AGENTPROC_MCP_CONTEXT_TOKEN` | 本轮入站消息的 `context_token`（chat / channel / request id） |
+| `IM_AGENTPROC_MCP_TO_USER` | 本轮入站消息的 `from_user`（为空时不写入该键） |
+
+在 bridge 进程 env 里 export 一次的值会被每轮覆盖——进程级 token 会把所有
+会话的回复都投到同一个 chat，所以 dispatcher 绝不回退到它。
+
+```sh
+# 不需要，而且有害：bridge 每轮自己设置这两个键。
+# export IM_AGENTPROC_MCP_CONTEXT_TOKEN="$INBOUND_CONTEXT"
+# export IM_AGENTPROC_MCP_TO_USER="$INBOUND_FROM_USER"
+```
+
+**凭据 —— 由运维提供，来自 bridge 进程 env。**
+
+```sh
+# bridge 进程（manager 或前台），启动前 export 一次：
+export IM_AGENTPROC_MCP_TRANSPORT=telegram
+export IM_AGENTPROC_MCP_TELEGRAM_TOKEN="$TELEGRAM_BOT_TOKEN"
+```
+
+`IM_AGENTPROC_MCP_FEISHU_APP_ID` / `_APP_SECRET`、
+`IM_AGENTPROC_MCP_WECOM_BOT_ID` / `_BOT_SECRET`、
+`IM_AGENTPROC_MCP_DISCORD_TOKEN`、`IM_AGENTPROC_MCP_ILINK_HUB_URL` /
+`_ILINK_TOKEN` 同理。
+
+因为 agentproc 每轮都新起一个 CLI 子进程，每个 `im-agentproc mcp-server`
+进程只会看到一轮的上下文——出站工具调用永远落在触发该轮运行的会话里。
 
 ## 工具清单
 
@@ -123,7 +166,7 @@ agent 只看到 success 信封。用户看到图表。
 
 | 现象 | 可能原因 |
 |---|---|
-| CLI 报 `unknown tool: send_image` | `mcp_servers` 块没接上，CLI 没连到 bridge 的 MCP server |
+| CLI 报 `unknown tool: send_image` | `mcp_servers` 块没接上，CLI 没有拉起 `im-agentproc mcp-server` 子进程 |
 | `transport '<name>' does not support media upload` | 该 IM adapter 没 override `send_media`；换 IM 或自己实现 override |
 | `read local media file <path>: No such file` | `file://` URL 指向 bridge 访问不到的路径（agent 跑在别的机器上）。改用 `data:` 或 `https:` |
 | IM API 返回 HTTP 401 / 403 | IM 凭据（`im_credentials.*` 或环境变量回退）缺失或过期 |

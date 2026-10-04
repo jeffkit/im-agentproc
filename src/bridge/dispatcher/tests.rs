@@ -1378,6 +1378,60 @@ async fn partial_persistent_throttle_gives_up_then_serves_new_chunk() {
     );
 }
 
+/// A profile whose CLI writes `stderr_line` to stderr and exits non-zero —
+/// agentproc turns that into `agent exited with code 1: <stderr_line>`, the
+/// exact text `handle_one_message` classifies.
+fn sh_fail_app(stderr_line: &str) -> BridgeApp {
+    BridgeApp::parse_yaml(
+        &format!(
+            "agentproc:\n  command: sh\n  args: [\"-c\", \"echo '{stderr_line}' >&2; exit 1\"]\n  timeout_secs: 10\n"
+        ),
+        "sh-fail".to_string(),
+    )
+    .unwrap()
+}
+
+/// Ordinary LLM-side errors name no credential problem and must stay
+/// per-message transients: a fatal classification exits the whole bridge
+/// process and interrupts every tenant on that profile.
+#[tokio::test]
+async fn handle_classifies_llm_errors_as_transient() {
+    for stderr_line in [
+        "API error: max_tokens(4096) reached",
+        "context tokens exceeded (200001 > 200000)",
+        "model not found: claude-nonexistent-9",
+        "tool not found: mcp__demo__missing",
+        "upstream responded 404 not found",
+    ] {
+        let app = sh_fail_app(stderr_line);
+        let client: Arc<dyn Transport> = Arc::new(ScriptedSender::new_loop(SendOutcome::Sent));
+        let msg = make_msg("ctx-llm-err", "default");
+        let result = handle_one_message(&client, &app, msg, CancellationToken::new()).await;
+        assert!(
+            matches!(result, Err(super::session::HandleError::Transient(_))),
+            "error text {stderr_line:?} must be a transient failure",
+        );
+    }
+}
+
+/// A genuine credential failure must keep stopping the bridge.
+#[tokio::test]
+async fn handle_classifies_genuine_auth_failure_as_fatal() {
+    let app = sh_fail_app("invalid api key provided");
+    let client: Arc<dyn Transport> = Arc::new(ScriptedSender::new_loop(SendOutcome::Sent));
+    let msg = make_msg("ctx-auth-err", "default");
+    let result = handle_one_message(&client, &app, msg, CancellationToken::new()).await;
+    assert!(
+        matches!(
+            result,
+            Err(super::session::HandleError::Fatal(
+                BridgeStop::FatalCliError(_)
+            ))
+        ),
+        "a credential failure must still be fatal",
+    );
+}
+
 /// Reproduce the full production message path (handle_one_message → executor →
 /// on_partial → reply) INSIDE a tokio runtime, so any `block_on`/block_in_place
 /// call from within the runtime surfaces with a clean, non-interleaved backtrace.
