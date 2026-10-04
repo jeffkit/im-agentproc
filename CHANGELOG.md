@@ -37,6 +37,14 @@ Versions follow [Semantic Versioning](https://semver.org/).
   exited the whole bridge process, interrupting every session on that profile.
 - The `Fatal` decision is now made by the single predicate
   `bridge::is_fatal_auth_error()`; `probe.rs` classification reuses it.
+- **Per-turn MCP conversation context.** The bridge no longer reads
+  `IM_AGENTPROC_MCP_CONTEXT_TOKEN` / `IM_AGENTPROC_MCP_TO_USER` from its own
+  process environment. `mcp_extra_env_for_profile()` now takes the current
+  inbound message's `context_token` / `from_user` and overwrites both keys on
+  every turn, so concurrent conversations can no longer cross-deliver outbound
+  `send_text` / `send_image` / `send_file` / `send_voice` calls (#4).
+  Credential keys (`IM_AGENTPROC_MCP_TRANSPORT`, the per-transport secrets,
+  `IM_AGENTPROC_MCP_ILINK_*`) are still forwarded from the bridge process env.
 
 ### Breaking
 

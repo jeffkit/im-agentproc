@@ -23,8 +23,9 @@ MCP is the right seam because:
 ## Profile wiring
 
 Add an `mcp_servers` block to the profile YAML. The exact shape depends on
-the CLI you wrap, but the bridge-side contract is: the bridge runs an MCP
-server on its own stdin/stdout; the CLI attaches to it.
+the CLI you wrap, but the bridge-side contract is: the profile CLI child
+spawns `im-agentproc mcp-server` as a stdio sub-process, and the bridge
+injects the per-turn conversation context into that child's env.
 
 ```yaml
 # ~/.im-agentproc/telegram-claude.yaml
@@ -36,43 +37,60 @@ agentproc:
   executor: claude-code
   mcp_servers:
     - name: im-agentproc
-      # The bridge process is the parent; the CLI child finds it via
-      # an inherited env var set by `build_transport`. Adjust per SDK.
-      command: ${IM_AGENTPROC_MCP_BRIDGE}
+      # The profile CLI child spawns this sub-process itself; it inherits
+      # the env the bridge injected for this turn. Adjust the shape per SDK.
+      command: im-agentproc
       args: ["mcp-server"]
 ```
 
-The `mcp-server` subcommand on the bridge binary is the entry point that
-runs `crate::mcp::run_server` against the current bridge's transport and
-inbound conversation context.
+`im-agentproc mcp-server` is the entry point that runs `crate::mcp::run_server`
+against the transport named by `IM_AGENTPROC_MCP_TRANSPORT` and the
+conversation context the bridge injected for the current turn.
 
-## Env-driven autostart (manager-friendly)
+## Per-turn context injection
 
-When the bridge manager launches a hub profile child, it can also forward
-the `IM_AGENTPROC_MCP_*` env vars it set up for itself. The bridge
-dispatcher collects them via `mcp_extra_env_for_profile()` in
-`bridge/dispatcher/handle.rs` and forwards the lot through the
-`agentproc::RunOptions::extra_env` channel — so the hub profile child
-sees the same `IM_AGENTPROC_MCP_TRANSPORT` / `IM_AGENTPROC_MCP_*_TOKEN`
-that the bridge did.
+Every inbound message runs the profile once, and for each run the bridge
+dispatcher (`mcp_extra_env_for_profile()` in `bridge/dispatcher/handle.rs`)
+assembles the `IM_AGENTPROC_MCP_*` map for *that* turn and hands it to
+`agentproc::RunOptions::extra_env`. `extra_env` is the highest-priority config
+layer, so it overrides same-named keys in the profile's `env:` block, and the
+profile child inherits the result.
 
-The convention lets a manager set up the env once and reuse it for every
-profile child:
+Two groups of keys:
+
+**Conversation context — injected by the bridge; never export these by hand.**
+
+| Key | Value for this turn |
+|---|---|
+| `IM_AGENTPROC_MCP_CONTEXT_TOKEN` | the inbound message's `context_token` (chat / channel / request id) |
+| `IM_AGENTPROC_MCP_TO_USER` | the inbound message's `from_user` (key omitted when empty) |
+
+A value exported once in the bridge process env is overwritten per turn — a
+process-wide token would deliver every conversation's replies to the same chat,
+so the dispatcher never falls back to it.
 
 ```sh
-# Bridge manager, on profile startup:
-export IM_AGENTPROC_MCP_AUTOSTART=1
-export IM_AGENTPROC_MCP_TRANSPORT=telegram
-export IM_AGENTPROC_MCP_CONTEXT_TOKEN="$INBOUND_CONTEXT"
-export IM_AGENTPROC_MCP_TO_USER="$INBOUND_FROM_USER"
-export IM_AGENTPROC_MCP_TELEGRAM_TOKEN="$TELEGRAM_BOT_TOKEN"
-im-agentproc --config ~/.im-agentproc/telegram-claude.yaml
+# Not needed, and actively wrong: the bridge sets these per turn.
+# export IM_AGENTPROC_MCP_CONTEXT_TOKEN="$INBOUND_CONTEXT"
+# export IM_AGENTPROC_MCP_TO_USER="$INBOUND_FROM_USER"
 ```
 
-`IM_AGENTPROC_MCP_AUTOSTART=1` is a marker so the child process knows it
-*should* spawn its own `im-agentproc mcp-server` subprocess. (Future
-revisions may add `_STDIN_FD` / `_STDOUT_FD` keys so the bridge can
-hand off pipes directly instead of leaving the spawn to the child.)
+**Credentials — provided by the operator, from the bridge process env.**
+
+```sh
+# Bridge process (manager or foreground), once:
+export IM_AGENTPROC_MCP_TRANSPORT=telegram
+export IM_AGENTPROC_MCP_TELEGRAM_TOKEN="$TELEGRAM_BOT_TOKEN"
+```
+
+The same holds for `IM_AGENTPROC_MCP_FEISHU_APP_ID` / `_APP_SECRET`,
+`IM_AGENTPROC_MCP_WECOM_BOT_ID` / `_BOT_SECRET`,
+`IM_AGENTPROC_MCP_DISCORD_TOKEN` and `IM_AGENTPROC_MCP_ILINK_HUB_URL` /
+`_ILINK_TOKEN`.
+
+Because agentproc spawns a fresh CLI child per turn, each
+`im-agentproc mcp-server` process sees exactly one turn's context — outbound
+tool calls always land in the conversation that triggered the run.
 
 ## Tool catalogue
 
@@ -155,7 +173,7 @@ If `media_upload` were false:
 
 | Symptom | Likely cause |
 |---|---|
-| `unknown tool: send_image` from the CLI | The `mcp_servers` block isn't wired; CLI never connected to the bridge's MCP server |
+| `unknown tool: send_image` from the CLI | The `mcp_servers` block isn't wired; the CLI never spawned the `im-agentproc mcp-server` sub-process |
 | `transport '<name>' does not support media upload` | This IM adapter doesn't override `send_media`; pick a different IM or implement the override |
 | `read local media file <path>: No such file` | `file://` URL points at a path the bridge can't reach (e.g. agent ran on a different host). Use `data:` or `https:` |
 | HTTP 401 / 403 from the underlying IM API | The IM credentials (`im_credentials.*` or env fallback) are missing or expired |
