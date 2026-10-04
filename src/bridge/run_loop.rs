@@ -14,10 +14,10 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use tracing::{info, warn};
 
+use super::transport::connection::{default_direct_credential_path, default_local_credential_path};
 use super::transport::registry::{TransportBuildCtx, TransportRegistry};
 use super::transport::Transport;
 use super::{run_bridge_with_shutdown, BridgeApp, BridgeStop, Via};
-use super::transport::connection::{default_direct_credential_path, default_local_credential_path};
 
 /// Everything the default bridge run needs. Plain values — no CLI types — so
 /// downstream crates can construct it without depending on our binary.
@@ -50,7 +50,10 @@ pub struct BridgeRunOptions {
 
 impl BridgeRunOptions {
     fn explicit_token(&self) -> Option<&str> {
-        self.explicit_token.as_deref().map(str::trim).filter(|s| !s.is_empty())
+        self.explicit_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
     }
 
     /// Build the configured transport for the current run.
@@ -87,6 +90,7 @@ impl BridgeRunOptions {
         info!(
             transport = ctx.kind.as_str(),
             media_upload = caps.media_upload,
+            max_text_len = ?caps.max_text_len,
             "transport built"
         );
         Ok(t)
@@ -143,8 +147,11 @@ pub async fn run_bridge_reconnecting(opts: BridgeRunOptions) -> Result<()> {
 
         let transport = opts.build_transport(description, interactive).await?;
 
-        let mut handle =
-            tokio::spawn(run_bridge_with_shutdown(transport, app.clone(), shutdown.clone()));
+        let mut handle = tokio::spawn(run_bridge_with_shutdown(
+            transport,
+            app.clone(),
+            shutdown.clone(),
+        ));
 
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {

@@ -46,8 +46,8 @@ pub trait Transport: Send + Sync {
 | `InboundOutcome` | `Messages(Vec<InboundMessage>)` 或 `TokenRejected`（401/吊销 → 重新注册）。 |
 | `InboundMessage` | `context_token`、`from_user`、`is_from_bot`、`text`、`media: Vec<MediaRef>`、`session_id`、`session_name`、`a2a_call_id`、`extra`（IM 私有）、`raw`（完整原始 JSON，诊断用）。 |
 | `OutboundReply` | `context_token`、`text`、`to_user`、`cli_session_id`、`session_name`、`a2a_call_id`、`usage`。 |
-| `SendOutcome` | `Sent` 或 `Throttled { ret, errmsg }`（退避重试）。 |
-| `TransportCapabilities` | `media_upload: bool`（typing / 已读回执延后——Q5）。 |
+| `SendOutcome` | `Sent`、`Throttled { ret, errmsg }`（退避重试）、`Rejected { ret, errmsg }`（确定性拒绝——不重试，由 dispatcher 把该段降级为半长分片）。 |
+| `TransportCapabilities` | `media_upload: bool`、`max_text_len: Option<usize>`（`None` = adapter 未声明客户端可见的通道上限，分片只受 profile 的 `max_reply_chars` 约束）。typing / 已读回执延后——Q5。 |
 
 ## 已实现适配器
 

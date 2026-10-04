@@ -47,8 +47,8 @@ pub trait Transport: Send + Sync {
 | `InboundOutcome` | `Messages(Vec<InboundMessage>)` or `TokenRejected` (401/revoked → re-register). |
 | `InboundMessage` | `context_token`, `from_user`, `is_from_bot`, `text`, `media: Vec<MediaRef>`, `session_id`, `session_name`, `a2a_call_id`, `extra` (IM-private), `raw` (full original JSON for diagnostics). |
 | `OutboundReply` | `context_token`, `text`, `to_user`, `cli_session_id`, `session_name`, `a2a_call_id`, `usage`. |
-| `SendOutcome` | `Sent` or `Throttled { ret, errmsg }` (retry with backoff). |
-| `TransportCapabilities` | `media_upload: bool` (typing / read receipts are deferred — Q5). |
+| `SendOutcome` | `Sent`, `Throttled { ret, errmsg }` (retry with backoff), or `Rejected { ret, errmsg }` (deterministic rejection — never retried; the dispatcher degrades the part to half-sized chunks). |
+| `TransportCapabilities` | `media_upload: bool`, `max_text_len: Option<usize>` (`None` = the adapter declares no client-visible channel cap, so only the profile's `max_reply_chars` bounds a chunk). Typing / read receipts are deferred — Q5. |
 
 ## Implemented adapters
 

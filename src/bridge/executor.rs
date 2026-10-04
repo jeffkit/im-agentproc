@@ -38,6 +38,18 @@ pub(super) fn split_into_parts(s: &str, max_chars: usize) -> Vec<String> {
     parts
 }
 
+/// Chunk size for a long reply: the profile cap further bounded by the
+/// transport's declared channel limit. `0` keeps its "do not split" meaning.
+pub(super) fn effective_chunk_chars(profile_max: usize, channel_cap: Option<usize>) -> usize {
+    if profile_max == 0 {
+        return 0;
+    }
+    match channel_cap {
+        Some(cap) if cap > 0 => profile_max.min(cap),
+        _ => profile_max,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -53,6 +65,14 @@ mod tests {
     #[test]
     fn split_into_parts_zero_limit_returns_whole() {
         assert_eq!(split_into_parts("abc", 0), vec!["abc"]);
+    }
+
+    #[test]
+    fn effective_chunk_chars_takes_min_of_profile_and_channel_cap() {
+        assert_eq!(effective_chunk_chars(8000, Some(4096)), 4096);
+        assert_eq!(effective_chunk_chars(8000, None), 8000);
+        assert_eq!(effective_chunk_chars(2000, Some(4096)), 2000);
+        assert_eq!(effective_chunk_chars(0, Some(4096)), 0);
     }
 
     #[test]
