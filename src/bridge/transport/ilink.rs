@@ -332,6 +332,8 @@ fn weixin_to_inbound(msg: WeixinMessage) -> InboundMessage {
         session_id,
         session_name,
         a2a_call_id,
+        // iLink 的 `context_token` 本身逐会话稳定：Hub 路由行为零变化。
+        dispatch_key: None,
         extra: serde_json::Value::Null,
         raw,
     }

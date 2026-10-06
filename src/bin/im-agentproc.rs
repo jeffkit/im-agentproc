@@ -250,6 +250,9 @@ async fn resolve_mcp_transport(transport_name: &str) -> Result<Arc<dyn Transport
         force_register: false,
         register_name: None,
         config_path: None,
+        // MCP 出站子进程恒传 `cli_session_id: None`：这里保持纯内存，
+        // 不与 bridge 进程同时写同一个 store 文件。
+        session_store_path: None,
         description: None,
         interactive: false,
         allow_null_placeholder: false,

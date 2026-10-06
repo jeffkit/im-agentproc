@@ -55,6 +55,28 @@ pub fn is_fatal_auth_error(cli_error_text: &str) -> bool {
     AUTH_ERROR_KEYWORDS.iter().any(|k| text.contains(k))
 }
 
+/// Full phrases that identify a *stale resume target* on their own: the CLI
+/// says the session we asked it to resume does not exist, which the dispatcher
+/// retries once with a cold session instead of failing the turn. Like
+/// [`AUTH_ERROR_KEYWORDS`], only unambiguous wording with a subject counts — a
+/// bare `not found` also matches `model not found`, `tool not found`, and a 404
+/// from an upstream service, none of which are stale sessions.
+pub const STALE_RESUME_ERROR_KEYWORDS: &[&str] = &[
+    "no conversation found with session id",
+    "conversation not found",
+    "session not found",
+    "no such session",
+    "session does not exist",
+    "thread not found",
+    "unknown session",
+];
+
+/// True when the CLI's error text says the resumed session no longer exists.
+pub fn is_stale_resume_error(cli_error_text: &str) -> bool {
+    let text = cli_error_text.to_lowercase();
+    STALE_RESUME_ERROR_KEYWORDS.iter().any(|k| text.contains(k))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -94,5 +116,35 @@ mod tests {
             *k,
             "token" | "auth" | "401" | "login" | "logout" | "credential"
         )));
+    }
+
+    #[test]
+    fn stale_resume_phrases_are_detected() {
+        for text in [
+            "No conversation found with session ID: stale-1",
+            "error: conversation not found",
+            "resume failed: session not found",
+            "no such session: abc-123",
+            "The session does not exist",
+            "thread not found",
+            "unknown session id",
+        ] {
+            assert!(is_stale_resume_error(text), "{text:?} 必须命中");
+        }
+    }
+
+    #[test]
+    fn issue3_control_texts_are_not_stale_resume() {
+        for text in [
+            "API error: max_tokens(4096) reached",
+            "model not found: claude-nonexistent-9",
+            "tool not found: mcp__demo__missing",
+            "upstream responded 404 not found",
+            "401 unauthorized",
+            "invalid api key provided",
+            "not logged in: run `login` first",
+        ] {
+            assert!(!is_stale_resume_error(text), "{text:?} 不能命中");
+        }
     }
 }

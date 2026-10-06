@@ -26,6 +26,7 @@ fn make_msg(ctx: &str, session_name: &str) -> InboundMessage {
         media: vec![],
         session_id: Some(String::new()),
         session_name: Some(session_name.into()),
+        dispatch_key: None,
         a2a_call_id: None,
         extra: serde_json::Value::Null,
         raw: serde_json::Value::Null,
@@ -107,6 +108,58 @@ async fn same_key_reuses_single_sender() {
     disp.dispatch(msg.clone()).await;
     disp.dispatch(msg.clone()).await;
     assert_eq!(disp.sender_keys(), vec!["ctx-a:default"]);
+}
+
+#[test]
+fn dispatch_key_overrides_context_token() {
+    let mut a = make_msg("req-1", "wecom-single");
+    a.dispatch_key = Some("wecom:chat-1".into());
+    let mut b = make_msg("req-2", "wecom-group");
+    b.dispatch_key = Some("wecom:chat-1".into());
+    assert_eq!(session_dispatch_key(&a), "wecom:chat-1");
+    assert_eq!(session_dispatch_key(&a), session_dispatch_key(&b));
+
+    // 空白 dispatch_key 视同未填，回退到 context_token:session_name。
+    let mut blank = make_msg("ctx-a", "default");
+    blank.dispatch_key = Some("   ".into());
+    assert_eq!(session_dispatch_key(&blank), "ctx-a:default");
+}
+
+#[tokio::test]
+async fn same_dispatch_key_reuses_single_sender() {
+    let disp = SessionDispatcher::new(
+        Arc::new(fake_transport()),
+        Arc::new(make_fast_app()),
+        make_stop_tx(),
+        CancellationToken::new(),
+    );
+    // 同一 chat 的两条消息：req_id（context_token）不同，dispatch_key 相同。
+    let mut first = make_msg("req-1", "wecom-single");
+    first.dispatch_key = Some("wecom:chat-1".into());
+    let mut second = make_msg("req-2", "wecom-single");
+    second.dispatch_key = Some("wecom:chat-1".into());
+    disp.dispatch(first).await;
+    disp.dispatch(second).await;
+    assert_eq!(disp.sender_keys(), vec!["wecom:chat-1"]);
+}
+
+#[tokio::test]
+async fn different_dispatch_keys_get_separate_senders() {
+    let disp = SessionDispatcher::new(
+        Arc::new(fake_transport()),
+        Arc::new(make_fast_app()),
+        make_stop_tx(),
+        CancellationToken::new(),
+    );
+    let mut first = make_msg("req-1", "wecom-single");
+    first.dispatch_key = Some("wecom:chat-1".into());
+    let mut second = make_msg("req-2", "wecom-single");
+    second.dispatch_key = Some("wecom:chat-2".into());
+    disp.dispatch(first).await;
+    disp.dispatch(second).await;
+    let mut keys = disp.sender_keys();
+    keys.sort();
+    assert_eq!(keys, vec!["wecom:chat-1", "wecom:chat-2"]);
 }
 
 #[tokio::test]

@@ -7,14 +7,16 @@
 //! the dispatcher depending on any IM's wire protocol.
 //!
 //! Design notes:
-//! - `session_id` / `session_name` / `a2a_call_id` are **bridge-runtime**
-//!   fields, not IM-protocol fields. They are first-class on the DTOs because
-//!   the dispatcher needs them for routing and CLI session continuity. For the
-//!   iLink-via-Hub adapter they are populated from `HubExt`; a non-iLink
-//!   adapter reads `session_id` from its own [`session_store::SessionStore`]
-//!   (keyed by `(transport, adapter conversation key)`, `None` on the first
-//!   turn) — it must **not** hand the IM conversation id to the CLI as a
-//!   resume id.
+//! - `session_id` / `session_name` / `a2a_call_id` / `dispatch_key` are
+//!   **bridge-runtime** fields, not IM-protocol fields. They are first-class on
+//!   the DTOs because the dispatcher needs them for routing and CLI session
+//!   continuity. For the iLink-via-Hub adapter they are populated from
+//!   `HubExt`; a non-iLink adapter reads `session_id` from its own
+//!   [`session_store::SessionStore`] (keyed by `(transport, adapter conversation
+//!   key)`, `None` on the first turn) — it must **not** hand the IM conversation
+//!   id to the CLI as a resume id. `dispatch_key` is the generic serialization
+//!   key: the dispatcher compares it, and only the adapter knows what a
+//!   conversation is.
 //! - `extra` carries IM-private data so the main DTO does not bloat. `raw`
 //!   holds the full original message as JSON for diagnostics.
 //! - Media upload / typing / read-receipts are NOT modelled yet (Q4/Q5): media
@@ -143,9 +145,16 @@ pub struct InboundMessage {
     /// `HubExt.session_id`; non-iLink adapters read it from the local
     /// `session_store`, `None` on the first turn of a conversation).
     pub session_id: Option<String>,
-    /// Bridge-runtime: human-readable session name, used as the dispatch key
-    /// and echoed on outbound for footer routing (iLink `HubExt.session_name`).
+    /// Bridge-runtime: human-readable session name, used as part of the
+    /// dispatch key and echoed on outbound for footer routing (iLink
+    /// `HubExt.session_name`).
     pub session_name: Option<String>,
+    /// Bridge-runtime: stable *conversation routing key*. When `Some`, the
+    /// dispatcher serializes messages that share it (one worker, arrival order)
+    /// instead of keying on `context_token:session_name`. Adapters whose reply
+    /// token is per-message (WeCom's `req_id`) fill the stable conversation id
+    /// here; the other adapters leave it `None` and keep the existing key.
+    pub dispatch_key: Option<String>,
     /// Bridge-runtime: A2A call identifier to echo back so Hub can resolve the
     /// MCP `call_agent` waiter (iLink `HubExt.a2a_call_id`).
     pub a2a_call_id: Option<String>,

@@ -12,6 +12,7 @@
 //! <https://open.feishu.cn/document/ukTMukTMukTM/uYDNxYjL2QTM24iN0EjN/event-subscription-configure->
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -22,7 +23,7 @@ use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, error, info, warn};
 
 use super::media::download_to_temp;
-use super::session_store::SessionStore;
+use super::session_store::{session_store_for, SessionStore};
 use super::{
     InboundMessage, InboundOutcome, MediaOut, MediaRef, OutboundReply, SendOutcome, Transport,
     TransportCapabilities,
@@ -107,8 +108,18 @@ pub struct FeishuTransport {
 
 impl FeishuTransport {
     /// Resolve adapter-owned credentials (profile `im_credentials.app_id` /
-    /// `app_secret` → env `FEISHU_APP_ID` / `FEISHU_APP_SECRET`).
+    /// `app_secret` → env `FEISHU_APP_ID` / `FEISHU_APP_SECRET`) and build the
+    /// transport with an in-memory session store.
     pub fn from_credentials(creds: &HashMap<String, String>) -> Result<Self> {
+        Self::from_credentials_with_store_path(creds, None)
+    }
+
+    /// Same as [`Self::from_credentials`], but persists the CLI session store to
+    /// `store_path` when `Some`.
+    pub fn from_credentials_with_store_path(
+        creds: &HashMap<String, String>,
+        store_path: Option<PathBuf>,
+    ) -> Result<Self> {
         let app_id = creds
             .get("app_id")
             .filter(|s| !s.trim().is_empty())
@@ -131,7 +142,12 @@ impl FeishuTransport {
             .context(
                 "transport: feishu 需要 im_credentials.app_secret 或环境变量 FEISHU_APP_SECRET",
             )?;
-        Self::new(app_id, app_secret)
+        Self::with_api_base_and_session_store(
+            app_id,
+            app_secret,
+            FEISHU_API.to_string(),
+            store_path,
+        )
     }
 
     /// 创建 Transport 并在后台启动飞书 WebSocket 长连接。
@@ -143,6 +159,17 @@ impl FeishuTransport {
     /// transport at a local mockito server; production code should call
     /// [`Self::new`].
     pub fn with_api_base(app_id: String, app_secret: String, api_base: String) -> Result<Self> {
+        Self::with_api_base_and_session_store(app_id, app_secret, api_base, None)
+    }
+
+    /// [`Self::with_api_base`] plus an explicit session-store file path
+    /// (`None` = in-memory only).
+    pub fn with_api_base_and_session_store(
+        app_id: String,
+        app_secret: String,
+        api_base: String,
+        store_path: Option<PathBuf>,
+    ) -> Result<Self> {
         let (inbound_tx, inbound_rx) = mpsc::unbounded_channel::<InboundOutcome>();
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(15))
@@ -163,7 +190,7 @@ impl FeishuTransport {
         let api_base_for_handler = api_base.clone();
         let token_cache_for_handler: Arc<Mutex<Option<TokenCache>>> = Arc::new(Mutex::new(None));
         let token_cache_ref = token_cache_for_handler.clone();
-        let sessions = Arc::new(SessionStore::new());
+        let sessions = session_store_for(store_path);
         let sessions_for_handler = sessions.clone();
 
         // Register event handler for inbound messages.
@@ -571,12 +598,13 @@ async fn feishu_event_to_inbound(
         media,
         session_id,
         session_name,
+        // `context_token` 已是稳定的 chat_id，无需额外的会话路由键。
+        dispatch_key: None,
         a2a_call_id: None,
         extra: inner.clone(),
         raw: event.clone(),
     })
 }
-
 /// Download a Feishu message resource (image/file/audio) using the message resource API.
 /// `resource_type` is the Feishu API type string: `"image"` or `"file"`.
 #[allow(clippy::too_many_arguments)]
@@ -829,6 +857,46 @@ mod session_store_tests {
         assert_eq!(
             turn.session_id, None,
             "首轮没有可续接的 CLI 会话；chat_id 只用于路由回复，不能当 resume id"
+        );
+    }
+
+    #[tokio::test]
+    async fn feishu_inbound_uses_reopened_session_store() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("feishu.sessions.json");
+
+        let first = FeishuTransport::with_api_base_and_session_store(
+            "cli_test".into(),
+            "secret_test".into(),
+            "http://127.0.0.1:1".into(),
+            Some(path.clone()),
+        )
+        .expect("transport");
+        // 空文本的「仅持久化」回包不触发 HTTP，但必须落盘。
+        first
+            .send_reply(OutboundReply {
+                context_token: "oc_1".into(),
+                text: String::new(),
+                cli_session_id: Some("cli-7".into()),
+                ..Default::default()
+            })
+            .await
+            .expect("persist reply");
+        drop(first);
+
+        let server = mockito::Server::new_async().await;
+        let reopened = FeishuTransport::with_api_base_and_session_store(
+            "cli_test".into(),
+            "secret_test".into(),
+            server.url(),
+            Some(path),
+        )
+        .expect("transport");
+        let turn = inbound_for(&reopened, "oc_1").await;
+        assert_eq!(
+            turn.session_id.as_deref(),
+            Some("cli-7"),
+            "重启后（同一 store 文件）必须读回上一轮的 cli_session_id"
         );
     }
 

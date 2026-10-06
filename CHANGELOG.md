@@ -13,6 +13,30 @@ Versions follow [Semantic Versioning](https://semver.org/).
   `4096`, Discord `2000`; ilink / wecom / feishu declare `None`.
 - **`SendOutcome::Rejected { ret, errmsg }`** for deterministic platform
   rejections, so the dispatcher can tell them apart from retryable throttles.
+- **Disk-persisted CLI session store for the non-iLink transports (#15).**
+  `SessionStore::open(path)` loads the `(transport, conversation key) →
+  cli_session_id` table at startup, writes it back throttled (first write
+  immediate, then at most once per second) through a same-directory temp file +
+  `rename` (atomic), and flushes once more on `Drop`. The bridge run path passes
+  `paths::session_store_path_for_profile(config_path)` — the profile YAML's
+  sibling file (`foo.yaml` → `foo.sessions.json`) — so Telegram / WeCom /
+  Feishu / Discord resume the previous CLI session after a bridge restart. A
+  missing, corrupt or unwritable file only logs a warning and degrades to the
+  in-memory store: the bridge still starts, and the MCP outbound subprocess
+  stays in-memory (`SessionStore::new()`).
+- **`InboundMessage.dispatch_key`** — a bridge-runtime conversation routing key.
+  When set, the dispatcher serializes messages sharing it onto one session
+  worker (arrival order) instead of keying on `context_token:session_name`; a
+  blank value falls back to the previous key. WeCom fills `wecom:{chatid}`
+  (its `context_token` is a per-message `req_id`), so messages of one WeCom
+  conversation are handled in order instead of each triggering a concurrent
+  turn. iLink / Telegram / Feishu / Discord leave it `None`: no behaviour change.
+- **Stale-resume fallback (#15).** `bridge::is_stale_resume_error()` matches the
+  full phrases a CLI uses when the session it was asked to resume no longer
+  exists (`no conversation found with session id`, `session not found`, …). When
+  a turn with a `session_id` fails that way and no partial chunk was forwarded
+  yet, the dispatcher re-runs the same turn once with a cold session instead of
+  replying with `（本地 CLI 失败）`.
 
 ### Changed
 
@@ -26,6 +50,9 @@ Versions follow [Semantic Versioning](https://semver.org/).
 - Telegram 4xx `sendMessage` errors, Discord client errors (400 code 50035 /
   413) and Feishu `99991400` (message too long, previously mapped to
   `Throttled`) now surface as `SendOutcome::Rejected`.
+- `InboundMessage` gained the `dispatch_key` field. Struct-literal constructors
+  must add it (`None` keeps the previous behaviour); sites using
+  `..Default::default()` are unaffected.
 
 ### Fixed
 
@@ -61,14 +88,15 @@ Versions follow [Semantic Versioning](https://semver.org/).
   streaming turn's persist-only reply still writes). WeCom keys the store on
   `chatid` because its `context_token` is a per-message `req_id` (still echoed
   verbatim as the reply token and MCP delivery address); the adapter maps
-  `req_id → chatid` internally. The store lives in the bridge process only, so
-  Telegram / WeCom / Feishu / Discord fall back to a fresh CLI session after a
-  bridge restart (iLink keeps persisting through the Hub).
+  `req_id → chatid` internally. The store is persisted per profile since #15, so
+  Telegram / WeCom / Feishu / Discord resume across a bridge restart (iLink
+  keeps persisting through the Hub).
 
 ### Breaking
 
-- `TransportCapabilities` gained the `max_text_len` field and `SendOutcome`
-  gained the `Rejected` variant. Downstream crates that build
+- `TransportCapabilities` gained the `max_text_len` field, `SendOutcome`
+  gained the `Rejected` variant and `InboundMessage` gained `dispatch_key`.
+  Downstream crates that build
   `TransportCapabilities` with a struct literal or exhaustively `match` on
   `SendOutcome` must be updated (`Default` still covers `::default()`).
 

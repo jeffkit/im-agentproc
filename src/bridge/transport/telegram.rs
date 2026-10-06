@@ -14,6 +14,7 @@
 //! downloaded to temp files and forwarded as `MediaRef` attachments.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -23,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use super::media::download_to_temp;
-use super::session_store::SessionStore;
+use super::session_store::{session_store_for, SessionStore};
 use super::{
     InboundMessage, InboundOutcome, MediaOut, MediaRef, OutboundReply, SendOutcome, Transport,
     TransportCapabilities,
@@ -166,8 +167,19 @@ pub struct TelegramTransport {
 
 impl TelegramTransport {
     /// Resolve adapter-owned credentials (profile `im_credentials.token` →
-    /// env `TELEGRAM_BOT_TOKEN`) and build the transport.
+    /// env `TELEGRAM_BOT_TOKEN`) and build the transport with an in-memory
+    /// session store.
     pub fn from_credentials(creds: &HashMap<String, String>) -> Result<Self> {
+        Self::from_credentials_with_store_path(creds, None)
+    }
+
+    /// Same as [`Self::from_credentials`], but persists the CLI session store to
+    /// `store_path` when `Some` (the bridge run path passes
+    /// `paths::session_store_path_for_profile`).
+    pub fn from_credentials_with_store_path(
+        creds: &HashMap<String, String>,
+        store_path: Option<PathBuf>,
+    ) -> Result<Self> {
         let token = creds
             .get("token")
             .filter(|s| !s.trim().is_empty())
@@ -180,7 +192,7 @@ impl TelegramTransport {
             .context(
                 "transport: telegram 需要 im_credentials.token 或环境变量 TELEGRAM_BOT_TOKEN",
             )?;
-        Self::new(token)
+        Self::with_base_url_and_session_store(token, BASE_URL.to_string(), store_path)
     }
 
     /// Create a new transport with the given bot token.
@@ -192,6 +204,16 @@ impl TelegramTransport {
     /// transport at a local mockito server; production code should call
     /// [`Self::new`].
     pub fn with_base_url(token: String, base_url: String) -> Result<Self> {
+        Self::with_base_url_and_session_store(token, base_url, None)
+    }
+
+    /// [`Self::with_base_url`] plus an explicit session-store file path
+    /// (`None` = in-memory only).
+    pub fn with_base_url_and_session_store(
+        token: String,
+        base_url: String,
+        store_path: Option<PathBuf>,
+    ) -> Result<Self> {
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(15))
             // Long-poll timeout + generous buffer
@@ -203,7 +225,7 @@ impl TelegramTransport {
             http,
             token,
             base_url,
-            sessions: Arc::new(SessionStore::new()),
+            sessions: session_store_for(store_path),
         })
     }
 
@@ -384,6 +406,8 @@ impl TelegramTransport {
             media,
             session_id,
             session_name,
+            // `context_token` 已是稳定的 chat_id，无需额外的会话路由键。
+            dispatch_key: None,
             a2a_call_id: None,
             extra,
             raw: serde_json::json!({}),
@@ -567,6 +591,111 @@ fn chat_name(chat: &Chat) -> Option<String> {
         .or(chat.username.as_deref())
         .or(chat.first_name.as_deref())
         .map(|s| s.to_string())
+}
+
+#[cfg(test)]
+mod session_store_tests {
+    use super::*;
+
+    fn store_path(dir: &tempfile::TempDir) -> PathBuf {
+        dir.path().join("telegram.sessions.json")
+    }
+
+    fn updates_body(update_id: i64, chat_id: i64) -> String {
+        serde_json::json!({
+            "ok": true,
+            "result": [{
+                "update_id": update_id,
+                "message": {
+                    "message_id": update_id,
+                    "chat": { "id": chat_id, "type": "private", "first_name": "T" },
+                    "from": { "id": 7, "first_name": "T", "is_bot": false },
+                    "text": "hi"
+                }
+            }]
+        })
+        .to_string()
+    }
+
+    async fn poll_one(t: &TelegramTransport) -> InboundMessage {
+        let mut buf = String::new();
+        let outcome = t.next_inbound(&mut buf).await.expect("next_inbound");
+        match outcome {
+            InboundOutcome::Messages(mut msgs) => msgs.pop().expect("one message"),
+            InboundOutcome::TokenRejected => panic!("unexpected TokenRejected"),
+        }
+    }
+
+    #[tokio::test]
+    async fn telegram_inbound_uses_reopened_session_store() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = store_path(&dir);
+
+        let first = TelegramTransport::with_base_url_and_session_store(
+            "123:abc".into(),
+            "http://127.0.0.1:1".into(),
+            Some(path.clone()),
+        )
+        .expect("transport");
+        // 空文本的持久化回包不发 HTTP，只写 store。
+        first
+            .send_reply(OutboundReply {
+                context_token: "4242".into(),
+                text: String::new(),
+                cli_session_id: Some("cli-7".into()),
+                ..Default::default()
+            })
+            .await
+            .expect("persist reply");
+        drop(first);
+
+        // 用同一路径重新构造（模拟 bridge 重启），入站转换必须读回会话号。
+        let mut server = mockito::Server::new_async().await;
+        let m = server
+            .mock("POST", "/bot123:abc/getUpdates")
+            .with_status(200)
+            .with_body(updates_body(1, 4242))
+            .create_async()
+            .await;
+        let reopened = TelegramTransport::with_base_url_and_session_store(
+            "123:abc".into(),
+            server.url(),
+            Some(path),
+        )
+        .expect("transport");
+
+        let turn = poll_one(&reopened).await;
+        m.assert_async().await;
+        assert_eq!(turn.session_id.as_deref(), Some("cli-7"));
+    }
+
+    #[tokio::test]
+    async fn telegram_in_memory_store_does_not_persist() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = store_path(&dir);
+        // 不注入路径 ⇒ 纯内存 store：`send_reply` 只写内存，不落盘。
+        let t = TelegramTransport::with_base_url_and_session_store(
+            "123:abc".into(),
+            "http://127.0.0.1:1".into(),
+            None,
+        )
+        .expect("transport");
+        t.send_reply(OutboundReply {
+            context_token: "4242".into(),
+            text: String::new(),
+            cli_session_id: Some("cli-7".into()),
+            ..Default::default()
+        })
+        .await
+        .expect("persist reply");
+        assert_eq!(
+            t.sessions.lookup("telegram", "4242").as_deref(),
+            Some("cli-7"),
+            "纯内存 store 仍要在本进程内续接"
+        );
+        drop(t);
+        assert!(!path.exists());
+    }
 }
 
 #[cfg(test)]

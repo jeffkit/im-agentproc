@@ -76,7 +76,7 @@ Bridge 连接飞书 WebSocket 网关，开始接收消息。向机器人发送�
 - **支持的消息类型**：`text`（文本）、`image`（图片）、`file`（文件）、`audio`（音频）。其他类型静默丢弃。
 - **媒体处理**：图片、文件和音频通过 `GET /open-apis/im/v1/messages/{id}/resources/{key}?type=image|file` 下载到本地临时文件，以 `file://` URL 形式作为 `MediaRef` 传递给 Agent。纯媒体消息（无文本）会生成 `[image]` 等占位文本以确保 Agent 收到消息。
 - **防循环**：`sender_type: bot` 的消息自动跳过。
-- **会话续接**：CLI 续接号来自 bridge 进程内的会话 store（键是飞书的 `chat_id`；`chat_id` 本身只用于路由回复），每个群聊/单聊独立维护 CLI 会话状态；bridge 重启后回到冷会话。
+- **会话续接**：CLI 续接号来自按 profile 落盘的会话 store（`<profile>.sessions.json`，与 profile YAML 同目录；键是飞书的 `chat_id`，`chat_id` 本身只用于路由回复），每个群聊/单聊独立维护 CLI 会话状态，bridge 重启后仍在。
 - **自动重连**：SDK 内置 `auto_reconnect=true`，自动处理重连。
 - **令牌管理**：`tenant_access_token` 在到期前 5 分钟自动刷新，事件处理器和发送路径共享同一缓存。
 
