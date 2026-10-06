@@ -62,7 +62,7 @@ The bridge connects to the Discord Gateway, identifies with your bot token, and 
 ## Notes
 
 - **Only text messages** (`MESSAGE_CREATE` with non-empty `content`) are handled. Bot messages are dropped (anti-loop).
-- **Session continuity**: the CLI resume id comes from the bridge's in-process session store, keyed by the Discord channel ID (the channel ID itself only routes replies) — each channel has its own CLI session, and a bridge restart starts a fresh CLI session.
+- **Session continuity**: the CLI resume id comes from the per-profile session store (`<profile>.sessions.json`, next to the profile YAML), keyed by the Discord channel ID (the channel ID itself only routes replies) — each channel has its own CLI session, which survives a bridge restart.
 - **Rate limits**: The Discord REST API enforces per-channel rate limits. The bridge does not implement retry-after handling in v1; if you send many messages quickly, some replies may fail.
 - **Reconnect**: The WebSocket worker reconnects automatically using the `RESUME` sequence (with saved `session_id` and `seq`) when the gateway closes cleanly; falls back to a fresh connection on stale sessions.
 

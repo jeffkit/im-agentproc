@@ -55,6 +55,11 @@ pub struct TransportBuildCtx {
     pub register_name: Option<String>,
     /// Profile YAML path (stored alongside resolved credentials).
     pub config_path: Option<PathBuf>,
+    /// Path of the per-profile CLI session store file
+    /// ([`crate::paths::session_store_path_for_profile`]). `Some` = the adapter
+    /// loads/persists session ids there; `None` (the MCP outbound subprocess and
+    /// every unit test) keeps the store in memory only.
+    pub session_store_path: Option<PathBuf>,
     /// Agent description recorded at registration time.
     pub description: Option<String>,
     /// Whether interactive flows (QR login on stdout TTY) are allowed.
@@ -162,7 +167,10 @@ macro_rules! adapter_entry {
         async fn $factory(ctx: &TransportBuildCtx) -> Result<Arc<dyn Transport>> {
             info!(transport = $log_name, $log_msg);
             // Credential parsing (incl. env fallback) is adapter-owned.
-            let t = <$adapter>::from_credentials(&ctx.im_credentials)?;
+            let t = <$adapter>::from_credentials_with_store_path(
+                &ctx.im_credentials,
+                ctx.session_store_path.clone(),
+            )?;
             Ok(Arc::new(t) as Arc<dyn Transport>)
         }
     };
@@ -321,6 +329,7 @@ mod tests {
             force_register: false,
             register_name: None,
             config_path: None,
+            session_store_path: None,
             description: None,
             interactive: false,
             allow_null_placeholder: false,

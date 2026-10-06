@@ -16,7 +16,7 @@ The bridge's core dispatcher speaks only **generic IM DTOs**. Each concrete IM p
                  └──────────────────────────────────────────┘
 ```
 
-The dispatcher never sees an IM-protocol-specific type. `session_id` / `session_name` / `a2a_call_id` are **bridge-runtime** fields, first-class on the DTOs because the dispatcher needs them for routing and CLI session continuity — they are populated by the adapter: from iLink `HubExt` for the iLink-via-Hub adapter; from the bridge-local `transport::session_store::SessionStore` (keyed by `(transport, adapter conversation key)`, empty on the first turn) for the others. An adapter must **never** hand its own IM conversation id (chat id / channel id) to the CLI as a resume id.
+The dispatcher never sees an IM-protocol-specific type. `session_id` / `session_name` / `a2a_call_id` / `dispatch_key` are **bridge-runtime** fields, first-class on the DTOs because the dispatcher needs them for routing and CLI session continuity — they are populated by the adapter: from iLink `HubExt` for the iLink-via-Hub adapter; from the bridge-local `transport::session_store::SessionStore` (keyed by `(transport, adapter conversation key)`, empty on the first turn) for the others. An adapter must **never** hand its own IM conversation id (chat id / channel id) to the CLI as a resume id. `dispatch_key` is the adapter's declaration of which messages belong to the same conversation; the dispatcher only compares the string.
 
 ## The `Transport` trait
 
@@ -45,7 +45,7 @@ pub trait Transport: Send + Sync {
 | Type | Role |
 |------|------|
 | `InboundOutcome` | `Messages(Vec<InboundMessage>)` or `TokenRejected` (401/revoked → re-register). |
-| `InboundMessage` | `context_token`, `from_user`, `is_from_bot`, `text`, `media: Vec<MediaRef>`, `session_id` (CLI resume id: iLink `HubExt.session_id`; non-iLink from the local session store, `None` on the first turn), `session_name`, `a2a_call_id`, `extra` (IM-private), `raw` (full original JSON for diagnostics). |
+| `InboundMessage` | `context_token`, `from_user`, `is_from_bot`, `text`, `media: Vec<MediaRef>`, `session_id` (CLI resume id: iLink `HubExt.session_id`; non-iLink from the local session store, `None` on the first turn), `session_name`, `dispatch_key` (stable conversation routing key: the dispatcher serializes messages sharing it; WeCom fills `wecom:{chatid}`, the other adapters leave it `None`), `a2a_call_id`, `extra` (IM-private), `raw` (full original JSON for diagnostics). |
 | `OutboundReply` | `context_token`, `text`, `to_user`, `cli_session_id`, `session_name`, `a2a_call_id`, `usage`. |
 | `SendOutcome` | `Sent`, `Throttled { ret, errmsg }` (retry with backoff), or `Rejected { ret, errmsg }` (deterministic rejection — never retried; the dispatcher degrades the part to half-sized chunks). |
 | `TransportCapabilities` | `media_upload: bool`, `max_text_len: Option<usize>` (`None` = the adapter declares no client-visible channel cap, so only the profile's `max_reply_chars` bounds a chunk). Typing / read receipts are deferred — Q5. |
@@ -140,7 +140,7 @@ pub type TransportFactory = Arc<
 >;
 ```
 
-A `TransportBuildCtx` carries everything an adapter may need (kind, `via`, hub/direct URLs, the `${VAR}`-expanded `im_credentials` map, explicit token, cred-file path, pairing flags, config path, interactivity) so factories never depend on CLI types. The built-in registry (`TransportRegistry::with_builtins()`) registers all in-tree adapters from the table above plus the `null` placeholder. Each adapter owns its credential parsing via `from_credentials` (profile `im_credentials:` → fallback env var) — the registry has no vendor-specific logic.
+A `TransportBuildCtx` carries everything an adapter may need (kind, `via`, hub/direct URLs, the `${VAR}`-expanded `im_credentials` map, explicit token, cred-file path, pairing flags, config path, session-store path, interactivity) so factories never depend on CLI types. The built-in registry (`TransportRegistry::with_builtins()`) registers all in-tree adapters from the table above plus the `null` placeholder. Each adapter owns its credential parsing via `from_credentials` (profile `im_credentials:` → fallback env var) — the registry has no vendor-specific logic.
 
 ### Registering an out-of-tree adapter
 
@@ -195,12 +195,20 @@ IM push ──▶ adapter receiver/worker ──▶ internal buffer ──▶ ne
 ## Adding a new IM
 
 1. **Implement `Transport`** for your IM in a new submodule under `src/bridge/transport/`. Translate your IM's inbound webhook/poll events into `InboundMessage` and your outbound sends from `OutboundReply`.
-2. **Populate the bridge-runtime fields.** `session_name` / `a2a_call_id` come from your IM's own metadata; `session_id` is a **CLI resume id**, so read it from the bridge-local `transport::session_store::SessionStore` (`pub(crate)`, key `(transport, your conversation key)` — e.g. the chat id) and write the reply's `cli_session_id` back in `send_reply` **before any early return**: a streaming turn's persist-only reply carries an empty `text` plus a `cli_session_id`, and dropping it loses the session for the whole conversation. Never pass your IM conversation id to the CLI as a resume id — agentproc renders it as `--resume <id>` and the CLI then fails on every turn. The store lives in this process only, so a bridge restart starts fresh CLI sessions for non-iLink channels (iLink keeps persisting through the Hub). If your IM's reply token is per-message rather than per-conversation (e.g. WeCom's `req_id`, which must be echoed verbatim), key the store on the stable conversation id and map the reply token back to it inside your adapter.
+2. **Populate the bridge-runtime fields.** `session_name` / `a2a_call_id` come from your IM's own metadata; `session_id` is a **CLI resume id**, so read it from the bridge-local `transport::session_store::SessionStore` (`pub(crate)`, key `(transport, your conversation key)` — e.g. the chat id) and write the reply's `cli_session_id` back in `send_reply` **before any early return**: a streaming turn's persist-only reply carries an empty `text` plus a `cli_session_id`, and dropping it loses the session for the whole conversation. Never pass your IM conversation id to the CLI as a resume id — agentproc renders it as `--resume <id>` and the CLI then fails on every turn. The store is persisted per profile (`<profile>.sessions.json`, next to the profile YAML) — pass the path into your constructor from `TransportBuildCtx::session_store_path` — so the CLI session survives a bridge restart; a missing / corrupt / unwritable file degrades to an in-memory store with a warning. If your IM's reply token is per-message rather than per-conversation (e.g. WeCom's `req_id`, which must be echoed verbatim), key the store on the stable conversation id and map the reply token back to it inside your adapter. Set `dispatch_key` to that same stable conversation id (`wecom:{chatid}` for WeCom): the dispatcher then runs all messages of one conversation through a single worker in arrival order instead of one worker per reply token.
 3. **Register the factory** under your `transport:` kind — built-in: one `register` call in `TransportRegistry::with_builtins`; external: your own registry (see above). Keep credential/env parsing inside the adapter (`from_credentials`).
 4. **Override `send_media`** if your IM can upload attachments — use `bridge::transport::media::read_media_bytes` to fetch the bytes from `MediaRef.url` (file / http(s) / base64 data URLs). Set `capabilities().media_upload = true` so the MCP server routes `send_image` / `send_file` / `send_voice` calls to you.
 5. **Carry IM-private data** in `InboundMessage.extra` rather than bloating the main DTO; keep `raw` as the full original message for diagnostics.
 
 The dispatcher, profile runner, session handling, anti-loop, and error paths are all IM-agnostic — you should not need to touch them.
+
+## CLI session continuity
+
+Three bridge-side mechanisms keep a non-iLink conversation on the same CLI session:
+
+- **Persistence.** `SessionStore` writes `(transport, conversation key) → cli_session_id` to `<profile>.sessions.json` — the profile YAML's sibling file, from `paths::session_store_path_for_profile`. The first write lands immediately, later ones are throttled to one per second (with a final flush on `Drop`), and the file is replaced atomically (same-directory temp file + `rename`). A missing, corrupt or unwritable file only logs a warning: the bridge starts normally and runs cold. The MCP outbound subprocess keeps the in-memory store (`SessionStore::new()`), so two processes never write the same file.
+- **Serialization.** Messages sharing a `dispatch_key` go to one session worker and are handled in arrival order. WeCom fills `wecom:{chatid}`; adapters whose `context_token` is already per-conversation leave it `None` and keep the `context_token:session_name` key. Known limit: each key's queue is `mpsc::channel(200)` — beyond that, messages are dropped as before.
+- **Stale resume.** If a turn that carried a `session_id` fails with a session-not-found error (`bridge::is_stale_resume_error()`) and no partial chunk was forwarded yet, the dispatcher re-runs the same turn once with a cold session instead of replying with the CLI error; every other failure still reports.
 
 ## Why `NullTransport` fails fast
 

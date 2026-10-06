@@ -6,7 +6,7 @@
 //! (`relay_secret`, `default_database_url`, `parse_host_port`) are NOT carried
 //! over.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// `~/.ilink-hub` (or `./.ilink-hub` when home is unavailable).
 pub fn data_dir() -> PathBuf {
@@ -69,6 +69,27 @@ pub fn desktop_bridge_profiles_dir() -> PathBuf {
 /// Desktop bridge manager credentials directory: `~/.ilink-hub/desktop-bridge/credentials`.
 pub fn desktop_bridge_credentials_dir() -> PathBuf {
     desktop_bridge_dir().join("credentials")
+}
+
+/// Session-store file for a bridge profile: the YAML's sibling file,
+/// `foo.yaml` → `foo.sessions.json`.
+///
+/// Kept next to the profile (like `im_credentials`' saved credential JSON) so
+/// each deployment — CLI manager under `~/.ilink-hub-bridge/profiles/`, desktop
+/// app under `~/.ilink-hub/desktop-bridge/profiles/` — writes its own session
+/// store and two deployments never share one. The manager's profile discovery
+/// only picks up `*.yaml` / `*.yml`, so a `.json` sibling is never mistaken for
+/// a profile.
+pub fn session_store_path_for_profile(config_path: &Path) -> PathBuf {
+    let stem = config_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("profile");
+    config_path
+        .parent()
+        .unwrap_or_else(|| Path::new(""))
+        .join(format!("{stem}.sessions.json"))
 }
 
 /// Expand a leading `~` or `$HOME` in a config path (YAML `cwd`, `script`, etc.).
@@ -140,6 +161,23 @@ mod tests {
         assert_eq!(
             desktop_bridge_credentials_dir(),
             base.join("desktop-bridge").join("credentials")
+        );
+    }
+
+    #[test]
+    fn session_store_path_is_a_yaml_sibling() {
+        assert_eq!(
+            session_store_path_for_profile(Path::new("/tmp/profiles/telegram.yaml")),
+            Path::new("/tmp/profiles/telegram.sessions.json")
+        );
+        assert_eq!(
+            session_store_path_for_profile(Path::new("/tmp/profiles/foo.bar.yml")),
+            Path::new("/tmp/profiles/foo.bar.sessions.json")
+        );
+        // 无扩展名时也能给出确定路径（不 panic）。
+        assert_eq!(
+            session_store_path_for_profile(Path::new("/tmp/profiles/x")),
+            Path::new("/tmp/profiles/x.sessions.json")
         );
     }
 

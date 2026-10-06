@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use tokio::sync::watch;
-use tracing::info;
+use tracing::{info, warn};
 
 use agentproc::{
     run, Attachment as ApAttachment, PermissionDecision, PermissionFuture, Profile as ApProfile,
@@ -26,6 +26,7 @@ use agentproc::{
 };
 
 use crate::bridge::config::BridgeProfile;
+use crate::bridge::is_stale_resume_error;
 
 /// Metrics collected for one agentproc run, mirroring the old CliRunSummary
 /// shape so handle.rs's logging / A1-dedup logic is unchanged.
@@ -101,24 +102,6 @@ pub(super) async fn run_via_agentproc(
 ) -> Result<(String, Option<String>, RunSummary)> {
     let ap_profile = to_agentproc_profile(profile);
 
-    // partial_count is tracked here via the on_partial callback — it is an
-    // ilink-hub IM-policy counter (A1 dedup), not a protocol field.
-    let partial_count = Arc::new(AtomicU32::new(0));
-    let partial_tx_for_cb = partial_tx.clone();
-    let partial_count_for_cb = Arc::clone(&partial_count);
-    let session_id_for_cb: Arc<std::sync::Mutex<String>> =
-        Arc::new(std::sync::Mutex::new(session_id.to_string()));
-
-    let on_partial = Arc::new(move |text: String, sid: Option<String>| {
-        partial_count_for_cb.fetch_add(1, Ordering::Relaxed);
-        if let Some(s) = sid {
-            if !s.is_empty() {
-                *session_id_for_cb.lock().unwrap() = s;
-            }
-        }
-        let _ = partial_tx_for_cb.send(Some(text));
-    }) as Arc<dyn Fn(String, Option<String>) + Send + Sync>;
-
     // on_permission: ilink-hub no longer layers a per-profile policy on top of
     // agentproc's permission channel. When `permission: true` enables the
     // channel, every tool request is auto-allowed (equivalent to skip-
@@ -142,66 +125,110 @@ pub(super) async fn run_via_agentproc(
     )
         as Arc<dyn Fn(agentproc::PermissionRequest) -> PermissionFuture + Send + Sync>;
 
-    let opts = RunOptions {
-        message: message.to_string(),
-        session_id: if session_id.is_empty() {
-            None
-        } else {
-            Some(session_id.to_string())
-        },
-        session_name: Some(session_name.to_string()),
-        from_user: Some(from_user.to_string()),
-        cwd: None,
-        profile_dir: None,
-        timeout_secs: Some(profile.timeout_secs),
-        streaming: Some(profile.streaming),
-        extra_env: mcp_extra_env,
-        attachments: attachments.to_vec(),
-        on_partial: Some(on_partial),
-        on_session: None,
-        on_error: None,
-        on_permission: profile.permission.then_some(on_permission),
-        on_stderr: None,
-    };
-
-    let result = run(&ap_profile, opts)
-        .await
-        .with_context(|| format!("agentproc run for profile `{profile_name}`"))?;
-
-    let cli_session = if result.session_id.is_empty() {
+    // At most two attempts: the second one (cold, no `--resume`) only happens
+    // when the CLI says the session we asked to resume no longer exists and the
+    // first attempt forwarded nothing to the user yet. Everything else keeps
+    // the original single-attempt behaviour.
+    let mut attempt_session: Option<String> = if session_id.is_empty() {
         None
     } else {
-        Some(result.session_id)
+        Some(session_id.to_string())
     };
-    let error_event = !result.error.is_empty();
-    let body = if error_event {
-        // agentproc surfaced an error; the error text was forwarded via
-        // on_partial-equivalent path is NOT available here, so surface it
-        // as the body. handle.rs treats error_event turns distinctly.
-        result.error.clone()
-    } else {
-        result.reply
-    };
+    let mut attempt: u8 = 0;
+    loop {
+        attempt += 1;
 
-    let summary = RunSummary {
-        duration_ms: result.duration_ms,
-        exit_code: if result.exit_code == 0 {
+        // partial_count is tracked here via the on_partial callback — it is an
+        // ilink-hub IM-policy counter (A1 dedup), not a protocol field.
+        let partial_count = Arc::new(AtomicU32::new(0));
+        let partial_tx_for_cb = partial_tx.clone();
+        let partial_count_for_cb = Arc::clone(&partial_count);
+        let session_id_for_cb: Arc<std::sync::Mutex<String>> = Arc::new(std::sync::Mutex::new(
+            attempt_session.clone().unwrap_or_default(),
+        ));
+
+        let on_partial = Arc::new(move |text: String, sid: Option<String>| {
+            partial_count_for_cb.fetch_add(1, Ordering::Relaxed);
+            if let Some(s) = sid {
+                if !s.is_empty() {
+                    *session_id_for_cb.lock().unwrap() = s;
+                }
+            }
+            let _ = partial_tx_for_cb.send(Some(text));
+        }) as Arc<dyn Fn(String, Option<String>) + Send + Sync>;
+
+        let opts = RunOptions {
+            message: message.to_string(),
+            session_id: attempt_session.clone(),
+            session_name: Some(session_name.to_string()),
+            from_user: Some(from_user.to_string()),
+            cwd: None,
+            profile_dir: None,
+            timeout_secs: Some(profile.timeout_secs),
+            streaming: Some(profile.streaming),
+            extra_env: mcp_extra_env.clone(),
+            attachments: attachments.to_vec(),
+            on_partial: Some(on_partial),
+            on_session: None,
+            on_error: None,
+            on_permission: profile.permission.then_some(on_permission.clone()),
+            on_stderr: None,
+        };
+
+        let result = run(&ap_profile, opts)
+            .await
+            .with_context(|| format!("agentproc run for profile `{profile_name}`"))?;
+
+        let error_event = !result.error.is_empty();
+
+        // A partial chunk already reached the user ⇒ never re-run (the repeated
+        // answer would interleave with what was already sent).
+        let partials_sent = partial_count.load(Ordering::Relaxed) > 0;
+        if error_event && attempt == 1 && !partials_sent && is_stale_resume_error(&result.error) {
+            if let Some(stale_session_id) = attempt_session.take() {
+                warn!(
+                    profile = %profile_name,
+                    stale_session_id = %stale_session_id,
+                    "resume 目标 CLI 会话不存在，回退冷启动重跑该轮"
+                );
+                continue;
+            }
+        }
+
+        let cli_session = if result.session_id.is_empty() {
             None
         } else {
-            Some(result.exit_code)
-        },
-        partial_count: partial_count.load(Ordering::Relaxed),
-        body_bytes: body.len(),
-        cli_session_present: cli_session.is_some(),
-        error_event,
-        usage: result.usage,
-    };
+            Some(result.session_id)
+        };
+        let body = if error_event {
+            // agentproc surfaced an error; the error text was forwarded via
+            // on_partial-equivalent path is NOT available here, so surface it
+            // as the body. handle.rs treats error_event turns distinctly.
+            result.error.clone()
+        } else {
+            result.reply
+        };
 
-    if error_event {
-        anyhow::bail!("{body}");
+        let summary = RunSummary {
+            duration_ms: result.duration_ms,
+            exit_code: if result.exit_code == 0 {
+                None
+            } else {
+                Some(result.exit_code)
+            },
+            partial_count: partial_count.load(Ordering::Relaxed),
+            body_bytes: body.len(),
+            cli_session_present: cli_session.is_some(),
+            error_event,
+            usage: result.usage,
+        };
+
+        if error_event {
+            anyhow::bail!("{body}");
+        }
+
+        return Ok((body, cli_session, summary));
     }
-
-    Ok((body, cli_session, summary))
 }
 
 #[cfg(test)]

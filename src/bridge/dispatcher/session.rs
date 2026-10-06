@@ -14,7 +14,18 @@ use super::handle::handle_one_message;
 use super::send::sanitize_errmsg;
 use super::BridgeStop;
 
+/// Messages sharing a dispatch key run on the same worker, in arrival order.
+/// `dispatch_key` (bridge-runtime, filled by adapters whose reply token is
+/// per-message) wins; otherwise the IM-agnostic `context_token:session_name`.
 pub(super) fn session_dispatch_key(msg: &InboundMessage) -> String {
+    if let Some(key) = msg
+        .dispatch_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|k| !k.is_empty())
+    {
+        return key.to_string();
+    }
     let ctx = msg.context_token.as_deref().unwrap_or("");
     let session_name = msg.session_name.as_deref().unwrap_or("default");
     format!("{ctx}:{session_name}")

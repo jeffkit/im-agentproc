@@ -57,7 +57,7 @@ Bridge 连接到 `wss://openai.work.weixin.qq.com/openai/connect/...`，订阅�
 
 - **当前仅支持文本消息**。附件、图片等回调会被忽略。
 - **防循环**：机器人自身发出的消息自动跳过。
-- **会话续接**：CLI 续接号存在 bridge 进程内的会话 store 里，键是企业微信会话 ID（客服机器人为 `open_kfid + external_userid`，群聊机器人为群 ID）。逐条消息的 `req_id` 只是回复 token（由适配器反查回会话键），每个会话独立维护 CLI 状态；bridge 重启后回到冷会话。
+- **会话续接**：CLI 续接号存在按 profile 落盘的会话 store 里（`<profile>.sessions.json`，与 profile YAML 同目录），键是企业微信会话 ID（客服机器人为 `open_kfid + external_userid`，群聊机器人为群 ID）。逐条消息的 `req_id` 只是回复 token（由适配器反查回会话键），每个会话独立维护 CLI 状态，bridge 重启后仍在。同一 chatid 的消息会进同一个 worker、按到达顺序处理（`dispatch_key = wecom:{chatid}`）；每个键的队列上限 200 条，超出仍按既有语义丢弃。已知残余：续接号在 WS 收包时解析，同一会话连发两条时第 2 条可能仍拿不到第 1 轮刚落盘的号而冷启动一轮。
 - **自动重连**：WebSocket 断线时以指数退避（5s → 最大 60s）自动重连。
 - **令牌刷新**：`access_token` 和 `aibot_ticket` 在到期前自动刷新。
 

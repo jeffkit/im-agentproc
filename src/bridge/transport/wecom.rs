@@ -12,6 +12,7 @@
 //! <https://developer.work.weixin.qq.com/document/path/101463>
 
 use std::collections::{HashMap, VecDeque};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -25,7 +26,7 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use super::media::download_to_temp;
-use super::session_store::SessionStore;
+use super::session_store::{session_store_for, SessionStore};
 use super::{
     InboundMessage, InboundOutcome, MediaOut, MediaRef, OutboundReply, SendOutcome, Transport,
     TransportCapabilities,
@@ -145,9 +146,10 @@ struct WecomSessions {
 }
 
 impl WecomSessions {
-    fn new() -> Self {
+    /// `Some(path)` → 落盘的 CLI 会话 store（`None` = 纯内存）。
+    fn with_store_path(store_path: Option<PathBuf>) -> Self {
         Self {
-            store: Arc::new(SessionStore::new()),
+            store: session_store_for(store_path),
             conv: std::sync::Mutex::new(WecomConv::default()),
         }
     }
@@ -496,10 +498,17 @@ impl WecomWsWorker {
             .and_then(|u| u.as_str())
             .map(|s| s.to_string());
 
-        let session_id = match body.get("chatid").and_then(|c| c.as_str()) {
-            Some(chat_id) => self.sessions.inbound_session(&req_id, chat_id),
-            None => None,
-        };
+        let chat_id = body
+            .get("chatid")
+            .and_then(|c| c.as_str())
+            .map(|s| s.to_string());
+        let session_id = chat_id
+            .as_deref()
+            .and_then(|chat_id| self.sessions.inbound_session(&req_id, chat_id));
+        // `context_token` 是本条消息的 `req_id`（回复逐字回填），同一 chat 的并发
+        // 消息因此会各建一个 worker、并发跑 CLI；`dispatch_key` 取稳定的 chatid，
+        // 让同一会话的消息在 dispatcher 里按到达顺序串行。
+        let dispatch_key = chat_id.as_deref().map(|chat_id| format!("wecom:{chat_id}"));
 
         let session_name = body
             .get("chattype")
@@ -514,6 +523,7 @@ impl WecomWsWorker {
             media,
             session_id,
             session_name,
+            dispatch_key,
             a2a_call_id: None,
             extra: body.clone(),
             raw: serde_json::to_value(msg.body.as_ref()).unwrap_or(serde_json::Value::Null),
@@ -537,8 +547,18 @@ pub struct WecomTransport {
 
 impl WecomTransport {
     /// Resolve adapter-owned credentials (profile `im_credentials.bot_id` /
-    /// `bot_secret` → env `WECOM_BOT_ID` / `WECOM_BOT_SECRET`).
+    /// `bot_secret` → env `WECOM_BOT_ID` / `WECOM_BOT_SECRET`), session store
+    /// kept in memory.
     pub fn from_credentials(creds: &HashMap<String, String>) -> Result<Self> {
+        Self::from_credentials_with_store_path(creds, None)
+    }
+
+    /// Same as [`Self::from_credentials`], but persists the CLI session store to
+    /// `store_path` when `Some`.
+    pub fn from_credentials_with_store_path(
+        creds: &HashMap<String, String>,
+        store_path: Option<PathBuf>,
+    ) -> Result<Self> {
         let bot_id = creds
             .get("bot_id")
             .filter(|s| !s.trim().is_empty())
@@ -561,11 +581,23 @@ impl WecomTransport {
             .context(
                 "transport: wecom 需要 im_credentials.bot_secret 或环境变量 WECOM_BOT_SECRET",
             )?;
-        Ok(Self::new(bot_id, bot_secret))
+        Ok(Self::new_with_session_store_path(
+            bot_id, bot_secret, store_path,
+        ))
     }
 
     /// Create the transport and spawn the background WebSocket worker.
     pub fn new(bot_id: String, bot_secret: String) -> Self {
+        Self::new_with_session_store_path(bot_id, bot_secret, None)
+    }
+
+    /// [`Self::new`] plus an explicit session-store file path (`None` =
+    /// in-memory only).
+    pub fn new_with_session_store_path(
+        bot_id: String,
+        bot_secret: String,
+        store_path: Option<PathBuf>,
+    ) -> Self {
         let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
         let (reply_tx, reply_rx) = mpsc::unbounded_channel();
 
@@ -575,7 +607,7 @@ impl WecomTransport {
             .build()
             .expect("failed to build reqwest client for WeCom");
 
-        let sessions = Arc::new(WecomSessions::new());
+        let sessions = Arc::new(WecomSessions::with_store_path(store_path));
         let worker = WecomWsWorker {
             bot_id,
             bot_secret,
@@ -818,22 +850,51 @@ mod session_store_tests {
         }
     }
 
-    async fn inbound_session(
+    async fn inbound_msg(
         sessions: &Arc<WecomSessions>,
         req_id: &str,
         chat_id: &str,
-    ) -> Option<String> {
+    ) -> InboundMessage {
         let worker = worker_for(sessions.clone());
         worker
             .wecom_callback_to_inbound(&callback(req_id, chat_id))
             .await
             .expect("inbound message")
-            .session_id
+    }
+
+    async fn inbound_session(
+        sessions: &Arc<WecomSessions>,
+        req_id: &str,
+        chat_id: &str,
+    ) -> Option<String> {
+        inbound_msg(sessions, req_id, chat_id).await.session_id
+    }
+
+    #[tokio::test]
+    async fn same_chat_id_shares_one_dispatch_key() {
+        let sessions = Arc::new(WecomSessions::with_store_path(None));
+        let first = inbound_msg(&sessions, "req-1", "chat-1").await;
+        let second = inbound_msg(&sessions, "req-2", "chat-1").await;
+
+        // context_token 逐条不同（回复逐字回填），dispatch_key 必须相同：
+        // 否则同一会话的两条消息会各起一个 worker 并发跑 CLI。
+        assert_ne!(first.context_token, second.context_token);
+        assert_eq!(first.dispatch_key.as_deref(), Some("wecom:chat-1"));
+        assert_eq!(first.dispatch_key, second.dispatch_key);
+    }
+
+    #[tokio::test]
+    async fn different_chat_ids_use_different_dispatch_keys() {
+        let sessions = Arc::new(WecomSessions::with_store_path(None));
+        let a = inbound_msg(&sessions, "req-1", "chat-1").await;
+        let b = inbound_msg(&sessions, "req-2", "chat-2").await;
+        assert_ne!(a.dispatch_key, b.dispatch_key);
+        assert_eq!(b.dispatch_key.as_deref(), Some("wecom:chat-2"));
     }
 
     #[tokio::test]
     async fn wecom_first_turn_has_no_resume_id() {
-        let sessions = Arc::new(WecomSessions::new());
+        let sessions = Arc::new(WecomSessions::with_store_path(None));
 
         // 第 1 轮：store 空 → 首轮必须无 resume id（且不能是 chatid / req_id）。
         let turn = inbound_session(&sessions, "req-1", "chat-1").await;
@@ -844,7 +905,7 @@ mod session_store_tests {
 
     #[tokio::test]
     async fn wecom_session_survives_the_next_turn_with_a_new_req_id() {
-        let sessions = Arc::new(WecomSessions::new());
+        let sessions = Arc::new(WecomSessions::with_store_path(None));
 
         assert_eq!(inbound_session(&sessions, "req-1", "chat-1").await, None);
 
@@ -861,7 +922,7 @@ mod session_store_tests {
 
     #[tokio::test]
     async fn wecom_blank_cli_session_id_does_not_clobber() {
-        let sessions = Arc::new(WecomSessions::new());
+        let sessions = Arc::new(WecomSessions::with_store_path(None));
         inbound_session(&sessions, "req-1", "chat-1").await;
         sessions.persist_reply_session("req-1", Some("cli-5"));
 
@@ -877,14 +938,32 @@ mod session_store_tests {
 
     #[tokio::test]
     async fn wecom_unknown_req_id_does_not_persist_or_panic() {
-        let sessions = Arc::new(WecomSessions::new());
+        let sessions = Arc::new(WecomSessions::with_store_path(None));
         sessions.persist_reply_session("unknown-req", Some("cli-9"));
         assert_eq!(inbound_session(&sessions, "req-1", "chat-1").await, None);
     }
 
     #[test]
+    fn wecom_session_survives_store_reopen() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("wecom.sessions.json");
+
+        let first = WecomSessions::with_store_path(Some(path.clone()));
+        assert_eq!(first.inbound_session("req-1", "chat-1"), None);
+        first.persist_reply_session("req-1", Some("cli-7"));
+        drop(first);
+
+        // 模拟 bridge 重启：同一 store 文件、全新 `req_id → chatid` 映射。
+        let reopened = WecomSessions::with_store_path(Some(path));
+        assert_eq!(
+            reopened.inbound_session("req-2", "chat-1").as_deref(),
+            Some("cli-7")
+        );
+    }
+
+    #[test]
     fn wecom_req_id_map_is_bounded_and_evicts_oldest() {
-        let sessions = WecomSessions::new();
+        let sessions = WecomSessions::with_store_path(None);
         for i in 0..=WECOM_REQ_MAP_MAX {
             sessions.inbound_session(&format!("req-{i}"), "chat-1");
         }

@@ -81,6 +81,9 @@ impl BridgeRunOptions {
             force_register: self.force_register,
             register_name: self.register_name.clone(),
             config_path: Some(self.config_path.clone()),
+            session_store_path: Some(crate::paths::session_store_path_for_profile(
+                &self.config_path,
+            )),
             description: description.map(str::to_string),
             interactive,
             allow_null_placeholder: self.allow_null_transport,

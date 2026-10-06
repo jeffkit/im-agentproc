@@ -119,6 +119,7 @@ fn inbound(ctx: &str) -> InboundMessage {
         media: vec![],
         session_id: Some(String::new()),
         session_name: Some("default".to_string()),
+        dispatch_key: None,
         a2a_call_id: None,
         extra: serde_json::Value::Null,
         raw: serde_json::Value::Null,
