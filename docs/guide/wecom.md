@@ -57,7 +57,7 @@ The bridge connects to `wss://openai.work.weixin.qq.com/openai/connect/...`, sub
 
 - **Only text messages** are handled in this version. Attachment/image callbacks are ignored.
 - **Anti-loop**: Bot-originated messages are skipped.
-- **Session continuity**: `session_id` is the WeCom conversation ID (`open_kfid + external_userid` for customer service bots, or the chat ID for group bots), so each conversation has independent CLI session tracking.
+- **Session continuity**: CLI resume ids live in the bridge's in-process session store, keyed by the WeCom chat ID (`open_kfid + external_userid` for customer service bots, or the chat ID for group bots). The per-message `req_id` is only the reply token — the adapter maps it back to the chat ID — so each conversation has independent CLI session tracking, and a bridge restart starts a fresh CLI session.
 - **Reconnect**: The WebSocket worker reconnects with exponential backoff (5s → 60s cap) on disconnect.
 - **Token refresh**: `access_token` and `aibot_ticket` are refreshed automatically before expiry.
 

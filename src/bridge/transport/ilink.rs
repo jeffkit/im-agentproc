@@ -543,6 +543,20 @@ mod tests {
     }
 
     #[test]
+    fn weixin_to_inbound_resumes_from_hub_ext_session_id() {
+        // Regression guard for the non-iLink adapters' `SessionStore` work:
+        // iLink-via-Hub keeps taking the resume id from `HubExt.session_id`
+        // (Hub persisted it), never from an IM conversation identifier.
+        let msg: WeixinMessage = serde_json::from_value(serde_json::json!({
+            "ilink_hub_ext": { "session_id": "hub-sid", "session_name": "default" }
+        }))
+        .expect("weixin message");
+        let inbound = weixin_to_inbound(msg);
+        assert_eq!(inbound.session_id.as_deref(), Some("hub-sid"));
+        assert_eq!(inbound.session_name.as_deref(), Some("default"));
+    }
+
+    #[test]
     fn parse_sendoutcome_three_categories() {
         // empty body → Sent (legacy fallback for servers that reply 200 + no body)
         assert_eq!(parse_sendoutcome("").unwrap(), SendOutcome::Sent);

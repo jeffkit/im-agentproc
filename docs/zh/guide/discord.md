@@ -62,7 +62,7 @@ Bridge 连接 Discord Gateway，开始接收 `MESSAGE_CREATE` 事件。在 Bot �
 ## 注意事项
 
 - **当前仅支持文本消息**（非空 `content` 的 `MESSAGE_CREATE`）。Bot 自身消息会被丢弃（防循环）。
-- **会话 ID** 是 Discord 频道 ID，每个频道独立维护 CLI 会话状态。
+- **会话续接**：CLI 续接号来自 bridge 进程内的会话 store（键是 Discord 频道 ID；频道 ID 本身只用于路由回复），每个频道独立维护 CLI 会话状态；bridge 重启后回到冷会话。
 - **频率限制**：Discord REST API 对每个频道有频率限制。v1 实现未对 `retry-after` 做重试处理，高频消息场景下个别回复可能失败。
 - **自动重连**：网关正常关闭时会用 `RESUME` 序列（保留 `session_id` 和序号）恢复；会话失效时回退到重新连接。
 

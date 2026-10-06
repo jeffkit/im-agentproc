@@ -50,6 +50,20 @@ Versions follow [Semantic Versioning](https://semver.org/).
   carries it, so the Hub still persists the CLI session id and the next message
   resumes the same session (previously every sub-part was sent with
   `cli_session_id: None`, silently breaking session continuity for that turn).
+- **CLI session continuity for the non-iLink transports (#5).** Telegram used to
+  send `session_id: None` on every turn (silent cold sessions), while WeCom /
+  Feishu / Discord passed the IM conversation id (chat id / channel id) to the
+  CLI, which agentproc rendered as `--resume <chat_id>` — a failing resume on
+  every turn, with no fallback. All four adapters now read the resume id from a
+  bridge-local, in-process `session_store::SessionStore` keyed by
+  `(transport, adapter conversation key)`, and persist the reply's
+  `cli_session_id` in `send_reply` (before the empty-text early return, so a
+  streaming turn's persist-only reply still writes). WeCom keys the store on
+  `chatid` because its `context_token` is a per-message `req_id` (still echoed
+  verbatim as the reply token and MCP delivery address); the adapter maps
+  `req_id → chatid` internally. The store lives in the bridge process only, so
+  Telegram / WeCom / Feishu / Discord fall back to a fresh CLI session after a
+  bridge restart (iLink keeps persisting through the Hub).
 
 ### Breaking
 

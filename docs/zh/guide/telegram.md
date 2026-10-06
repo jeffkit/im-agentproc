@@ -47,7 +47,7 @@ TELEGRAM_BOT_TOKEN=123456:ABCdef... \
 
 - **当前仅支持文本消息**。语音、图片、文档等类型会被忽略。
 - **防循环**：Bot 自身发出的消息自动丢弃。
-- **群聊**：需将 Bot 添加到群组。`session_id` 是 chat_id，每个会话独立维护 CLI 状态。
+- **群聊**：需将 Bot 添加到群组。chat_id 只用于路由与本地 store 的键，CLI 续接号来自 bridge 进程内的会话 store；每个会话独立维护 CLI 状态（bridge 重启后回到冷会话）。
 - **偏移量**：`getUpdates` 偏移量仅在内存中保持。重启 Bridge 会重新处理未确认的消息。
 
 ## 常见问题

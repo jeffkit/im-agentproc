@@ -54,7 +54,7 @@ Send a message to your bot in Telegram — the bridge picks it up, runs the prof
 
 - **Only text messages are supported** in the initial implementation. Voice, photos, documents, etc. are ignored.
 - **Anti-loop**: Messages sent by bots are dropped automatically.
-- **Group chats**: The bot must be added to the group and either mentioned or replied to directly. The `session_id` is the chat ID, so each chat is an independent session.
+- **Group chats**: The bot must be added to the group and either mentioned or replied to directly. The chat ID is only the routing key (and the local store key); the CLI resume id comes from the bridge's in-process session store, so each chat is an independent session, and a bridge restart starts a fresh CLI session.
 - **Offset persistence**: The bridge keeps the `getUpdates` offset in memory. Restarting the bridge re-reads unacknowledged messages.
 
 ## Troubleshooting

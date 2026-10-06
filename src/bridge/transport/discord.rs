@@ -22,6 +22,7 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tracing::{debug, error, info, warn};
 
 use super::media::{download_to_temp, filename_from_url, read_media_bytes};
+use super::session_store::SessionStore;
 use super::{
     InboundMessage, InboundOutcome, MediaOut, MediaRef, OutboundReply, SendOutcome, Transport,
     TransportCapabilities,
@@ -129,6 +130,8 @@ struct DiscordWsWorker {
     inbound_tx: mpsc::UnboundedSender<InboundOutcome>,
     /// Application's own user ID (set after READY).
     own_id: Arc<Mutex<Option<String>>>,
+    /// `(transport, channel_id) → cli_session_id`，与 transport 共享同一实例。
+    sessions: Arc<SessionStore>,
 }
 
 impl DiscordWsWorker {
@@ -491,7 +494,7 @@ impl DiscordWsWorker {
             is_from_bot: false,
             text,
             media,
-            session_id: Some(channel_id),
+            session_id: self.sessions.lookup("discord", &channel_id),
             session_name,
             a2a_call_id: None,
             extra: data.clone(),
@@ -510,6 +513,8 @@ pub struct DiscordTransport {
     /// API base url (defaults to `https://discord.com/api/v10`; tests override
     /// to point at a mockito server).
     api_base: String,
+    /// `(transport, channel_id) → cli_session_id`，与 WS worker 共享同一实例。
+    sessions: Arc<SessionStore>,
 }
 
 impl DiscordTransport {
@@ -547,12 +552,14 @@ impl DiscordTransport {
             .context("failed to build reqwest client for Discord")?;
 
         let own_id = Arc::new(Mutex::new(None::<String>));
+        let sessions = Arc::new(SessionStore::new());
 
         let worker = DiscordWsWorker {
             bot_token: bot_token.clone(),
             http: http.clone(),
             inbound_tx,
             own_id,
+            sessions: sessions.clone(),
         };
         tokio::spawn(worker.run());
 
@@ -561,6 +568,7 @@ impl DiscordTransport {
             http,
             bot_token,
             api_base,
+            sessions,
         })
     }
 }
@@ -577,6 +585,13 @@ impl Transport for DiscordTransport {
 
     fn send_reply<'a>(&'a self, reply: OutboundReply) -> BoxFuture<'a, Result<SendOutcome>> {
         Box::pin(async move {
+            // Persist before the empty-text early return: a streaming turn's
+            // "persist-only" reply has an empty body + a `cli_session_id`.
+            self.sessions.remember(
+                "discord",
+                &reply.context_token,
+                reply.cli_session_id.as_deref(),
+            );
             if reply.text.trim().is_empty() {
                 return Ok(SendOutcome::Sent);
             }
@@ -897,5 +912,123 @@ mod send_media_e2e_tests {
             other => panic!("expected Rejected, got {other:?}"),
         }
         m.assert_async().await;
+    }
+}
+
+#[cfg(test)]
+mod session_store_tests {
+    use super::*;
+
+    fn message_json(channel_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "author": { "id": "u_1", "bot": false },
+            "channel_id": channel_id,
+            "content": "hi"
+        })
+    }
+
+    /// 复用 `transport.sessions` 手搓一个 worker，只为调用 `discord_msg_to_inbound`。
+    fn worker_for(t: &DiscordTransport) -> DiscordWsWorker {
+        let (inbound_tx, _inbound_rx) = mpsc::unbounded_channel();
+        DiscordWsWorker {
+            bot_token: t.bot_token.clone(),
+            http: t.http.clone(),
+            inbound_tx,
+            own_id: Arc::new(Mutex::new(None)),
+            sessions: t.sessions.clone(),
+        }
+    }
+
+    async fn inbound_for(t: &DiscordTransport, channel_id: &str) -> InboundMessage {
+        worker_for(t)
+            .discord_msg_to_inbound(&message_json(channel_id), None)
+            .await
+            .expect("inbound message")
+    }
+
+    #[tokio::test]
+    async fn first_turn_has_no_resume_id() {
+        let server = mockito::Server::new_async().await;
+        let t = DiscordTransport::with_api_base("test-bot-token".into(), server.url())
+            .expect("test transport");
+
+        let turn = inbound_for(&t, "ch-1").await;
+        assert_eq!(turn.context_token.as_deref(), Some("ch-1"));
+        assert_eq!(
+            turn.session_id, None,
+            "首轮没有可续接的 CLI 会话；channel_id 只用于路由回复，不能当 resume id"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_reply_persists_cli_session_for_the_next_turn() {
+        let mut server = mockito::Server::new_async().await;
+        let m = server
+            .mock("POST", "/channels/ch-1/messages")
+            .with_status(200)
+            .with_body(r#"{"id":"9001","channel_id":"ch-1"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let t = DiscordTransport::with_api_base("test-bot-token".into(), server.url())
+            .expect("test transport");
+
+        let outcome = t
+            .send_reply(OutboundReply {
+                context_token: "ch-1".into(),
+                text: "reply".into(),
+                cli_session_id: Some("cli-7".into()),
+                ..Default::default()
+            })
+            .await
+            .expect("send ok");
+        assert_eq!(outcome, SendOutcome::Sent);
+
+        assert_eq!(
+            inbound_for(&t, "ch-1").await.session_id.as_deref(),
+            Some("cli-7"),
+            "回包里的 cli_session_id 必须落进本地 store，并在同一会话的下一轮读回"
+        );
+        m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn persist_only_reply_writes_and_blank_id_does_not_clobber() {
+        let server = mockito::Server::new_async().await;
+        let t = DiscordTransport::with_api_base("test-bot-token".into(), server.url())
+            .expect("test transport");
+
+        // 空文本的「仅持久化」回包不触发 HTTP（没有 mock，一旦发请求即失败），
+        // 但必须写 store。
+        let outcome = t
+            .send_reply(OutboundReply {
+                context_token: "ch-2".into(),
+                text: String::new(),
+                cli_session_id: Some("cli-9".into()),
+                ..Default::default()
+            })
+            .await
+            .expect("persist-only send_reply ok");
+        assert_eq!(outcome, SendOutcome::Sent);
+        assert_eq!(
+            inbound_for(&t, "ch-2").await.session_id.as_deref(),
+            Some("cli-9")
+        );
+
+        for sid in [None, Some("  ".to_string())] {
+            t.send_reply(OutboundReply {
+                context_token: "ch-2".into(),
+                text: String::new(),
+                cli_session_id: sid,
+                ..Default::default()
+            })
+            .await
+            .expect("blank cli_session_id ignored");
+        }
+        assert_eq!(
+            inbound_for(&t, "ch-2").await.session_id.as_deref(),
+            Some("cli-9"),
+            "空串 / None 的 cli_session_id 不得覆盖已存的会话号"
+        );
     }
 }

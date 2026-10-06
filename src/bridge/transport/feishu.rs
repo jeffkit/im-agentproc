@@ -22,6 +22,7 @@ use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, error, info, warn};
 
 use super::media::download_to_temp;
+use super::session_store::SessionStore;
 use super::{
     InboundMessage, InboundOutcome, MediaOut, MediaRef, OutboundReply, SendOutcome, Transport,
     TransportCapabilities,
@@ -100,6 +101,8 @@ pub struct FeishuTransport {
     /// API base url. Defaults to `https://open.feishu.cn/open-apis`; tests
     /// override to point at a mockito server.
     api_base: String,
+    /// `(transport, chat_id) → cli_session_id`，由本进程的 `send_reply` 回填。
+    sessions: Arc<SessionStore>,
 }
 
 impl FeishuTransport {
@@ -160,6 +163,8 @@ impl FeishuTransport {
         let api_base_for_handler = api_base.clone();
         let token_cache_for_handler: Arc<Mutex<Option<TokenCache>>> = Arc::new(Mutex::new(None));
         let token_cache_ref = token_cache_for_handler.clone();
+        let sessions = Arc::new(SessionStore::new());
+        let sessions_for_handler = sessions.clone();
 
         // Register event handler for inbound messages.
         // on_event receives larksuite_oapi_sdk_rs::JsonValue (transparent wrapper around
@@ -173,6 +178,7 @@ impl FeishuTransport {
                 let app_secret = app_secret_for_handler.clone();
                 let api_base = api_base_for_handler.clone();
                 let token_cache = token_cache_ref.clone();
+                let sessions = sessions_for_handler.clone();
                 async move {
                     if let Some(msg) = feishu_event_to_inbound(
                         event.as_value(),
@@ -181,6 +187,7 @@ impl FeishuTransport {
                         &app_secret,
                         &api_base,
                         &token_cache,
+                        &sessions,
                     )
                     .await
                     {
@@ -208,6 +215,7 @@ impl FeishuTransport {
             // Share token_cache with the event handler so both use the same cached token.
             token_cache: token_cache_for_handler,
             api_base,
+            sessions,
         })
     }
 
@@ -235,6 +243,13 @@ impl Transport for FeishuTransport {
 
     fn send_reply<'a>(&'a self, reply: OutboundReply) -> BoxFuture<'a, Result<SendOutcome>> {
         Box::pin(async move {
+            // Persist before the empty-text early return: a streaming turn's
+            // "persist-only" reply has an empty body + a `cli_session_id`.
+            self.sessions.remember(
+                "feishu",
+                &reply.context_token,
+                reply.cli_session_id.as_deref(),
+            );
             if reply.text.trim().is_empty() {
                 return Ok(SendOutcome::Sent);
             }
@@ -406,6 +421,7 @@ async fn feishu_event_to_inbound(
     app_secret: &str,
     api_base: &str,
     token_cache: &Arc<Mutex<Option<TokenCache>>>,
+    sessions: &SessionStore,
 ) -> Option<InboundMessage> {
     // The `on_event` handler receives the full event body.
     // Navigate to the inner `event` field if present.
@@ -543,6 +559,9 @@ async fn feishu_event_to_inbound(
         .map(|s| s.to_string());
 
     let session_name = chat_type.as_deref().map(|t| format!("feishu-{t}"));
+    let session_id = chat_id
+        .as_deref()
+        .and_then(|c| sessions.lookup("feishu", c));
 
     Some(InboundMessage {
         context_token: chat_id.clone(),
@@ -550,7 +569,7 @@ async fn feishu_event_to_inbound(
         is_from_bot: false,
         text,
         media,
-        session_id: chat_id,
+        session_id,
         session_name,
         a2a_call_id: None,
         extra: inner.clone(),
@@ -758,5 +777,136 @@ mod send_media_e2e_tests {
         let err = t.send_media(ctx, png_payload()).await.unwrap_err();
         assert!(format!("{err:#}").contains("upload failed"));
         m_upload.assert_async().await;
+    }
+}
+
+#[cfg(test)]
+mod session_store_tests {
+    use super::*;
+
+    fn transport_for(api_base: String) -> FeishuTransport {
+        FeishuTransport::with_api_base("cli_test".into(), "secret_test".into(), api_base)
+            .expect("test transport")
+    }
+
+    /// `content` 是 JSON **字符串**（飞书事件格式）。
+    fn text_event(chat_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "event": {
+                "sender": { "sender_type": "user", "sender_id": { "user_id": "u_1" } },
+                "message": {
+                    "message_id": "om_1",
+                    "chat_id": chat_id,
+                    "chat_type": "p2p",
+                    "msg_type": "text",
+                    "content": "{\"text\":\"hi\"}"
+                }
+            }
+        })
+    }
+
+    async fn inbound_for(t: &FeishuTransport, chat_id: &str) -> InboundMessage {
+        feishu_event_to_inbound(
+            &text_event(chat_id),
+            &t.http,
+            &t.app_id,
+            &t.app_secret,
+            &t.api_base,
+            &t.token_cache,
+            &t.sessions,
+        )
+        .await
+        .expect("inbound message")
+    }
+
+    #[tokio::test]
+    async fn first_turn_has_no_resume_id() {
+        let server = mockito::Server::new_async().await;
+        let t = transport_for(server.url());
+
+        let turn = inbound_for(&t, "oc_1").await;
+        assert_eq!(turn.context_token.as_deref(), Some("oc_1"));
+        assert_eq!(
+            turn.session_id, None,
+            "首轮没有可续接的 CLI 会话；chat_id 只用于路由回复，不能当 resume id"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_reply_persists_cli_session_for_the_next_turn() {
+        let mut server = mockito::Server::new_async().await;
+        let m_token = server
+            .mock("POST", "/auth/v3/tenant_access_token/internal")
+            .with_status(200)
+            .with_body(r#"{"code":0,"msg":"ok","tenant_access_token":"t-1","expire":7200}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let m_send = server
+            .mock("POST", "/im/v1/messages?receive_id_type=chat_id")
+            .with_status(200)
+            .with_body(r#"{"code":0,"msg":"ok"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let t = transport_for(server.url());
+
+        let outcome = t
+            .send_reply(OutboundReply {
+                context_token: "oc_1".into(),
+                text: "reply".into(),
+                cli_session_id: Some("cli-7".into()),
+                ..Default::default()
+            })
+            .await
+            .expect("send ok");
+        assert_eq!(outcome, SendOutcome::Sent);
+
+        let turn = inbound_for(&t, "oc_1").await;
+        assert_eq!(
+            turn.session_id.as_deref(),
+            Some("cli-7"),
+            "回包里的 cli_session_id 必须落进本地 store，并在同一会话的下一轮读回"
+        );
+        m_token.assert_async().await;
+        m_send.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn persist_only_reply_writes_and_blank_id_does_not_clobber() {
+        let server = mockito::Server::new_async().await;
+        let t = transport_for(server.url());
+
+        // 空文本的「仅持久化」回包不触发 HTTP，但必须写 store。
+        let outcome = t
+            .send_reply(OutboundReply {
+                context_token: "oc_2".into(),
+                text: String::new(),
+                cli_session_id: Some("cli-9".into()),
+                ..Default::default()
+            })
+            .await
+            .expect("persist-only send_reply ok");
+        assert_eq!(outcome, SendOutcome::Sent);
+        assert_eq!(
+            inbound_for(&t, "oc_2").await.session_id.as_deref(),
+            Some("cli-9")
+        );
+
+        for sid in [None, Some("  ".to_string())] {
+            t.send_reply(OutboundReply {
+                context_token: "oc_2".into(),
+                text: String::new(),
+                cli_session_id: sid,
+                ..Default::default()
+            })
+            .await
+            .expect("blank cli_session_id ignored");
+        }
+        assert_eq!(
+            inbound_for(&t, "oc_2").await.session_id.as_deref(),
+            Some("cli-9"),
+            "空串 / None 的 cli_session_id 不得覆盖已存的会话号"
+        );
     }
 }

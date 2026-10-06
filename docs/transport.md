@@ -16,7 +16,7 @@ The bridge's core dispatcher speaks only **generic IM DTOs**. Each concrete IM p
                  └──────────────────────────────────────────┘
 ```
 
-The dispatcher never sees an IM-protocol-specific type. `session_id` / `session_name` / `a2a_call_id` are **bridge-runtime** fields, first-class on the DTOs because the dispatcher needs them for routing and CLI session continuity — they are populated by the adapter (from iLink `HubExt` for the iLink-via-Hub adapter; from each IM's own conversation identifiers for others).
+The dispatcher never sees an IM-protocol-specific type. `session_id` / `session_name` / `a2a_call_id` are **bridge-runtime** fields, first-class on the DTOs because the dispatcher needs them for routing and CLI session continuity — they are populated by the adapter: from iLink `HubExt` for the iLink-via-Hub adapter; from the bridge-local `transport::session_store::SessionStore` (keyed by `(transport, adapter conversation key)`, empty on the first turn) for the others. An adapter must **never** hand its own IM conversation id (chat id / channel id) to the CLI as a resume id.
 
 ## The `Transport` trait
 
@@ -45,7 +45,7 @@ pub trait Transport: Send + Sync {
 | Type | Role |
 |------|------|
 | `InboundOutcome` | `Messages(Vec<InboundMessage>)` or `TokenRejected` (401/revoked → re-register). |
-| `InboundMessage` | `context_token`, `from_user`, `is_from_bot`, `text`, `media: Vec<MediaRef>`, `session_id`, `session_name`, `a2a_call_id`, `extra` (IM-private), `raw` (full original JSON for diagnostics). |
+| `InboundMessage` | `context_token`, `from_user`, `is_from_bot`, `text`, `media: Vec<MediaRef>`, `session_id` (CLI resume id: iLink `HubExt.session_id`; non-iLink from the local session store, `None` on the first turn), `session_name`, `a2a_call_id`, `extra` (IM-private), `raw` (full original JSON for diagnostics). |
 | `OutboundReply` | `context_token`, `text`, `to_user`, `cli_session_id`, `session_name`, `a2a_call_id`, `usage`. |
 | `SendOutcome` | `Sent`, `Throttled { ret, errmsg }` (retry with backoff), or `Rejected { ret, errmsg }` (deterministic rejection — never retried; the dispatcher degrades the part to half-sized chunks). |
 | `TransportCapabilities` | `media_upload: bool`, `max_text_len: Option<usize>` (`None` = the adapter declares no client-visible channel cap, so only the profile's `max_reply_chars` bounds a chunk). Typing / read receipts are deferred — Q5. |
@@ -195,7 +195,7 @@ IM push ──▶ adapter receiver/worker ──▶ internal buffer ──▶ ne
 ## Adding a new IM
 
 1. **Implement `Transport`** for your IM in a new submodule under `src/bridge/transport/`. Translate your IM's inbound webhook/poll events into `InboundMessage` and your outbound sends from `OutboundReply`.
-2. **Populate the bridge-runtime fields** (`session_id`, `session_name`, `a2a_call_id`) from your IM's conversation identifiers so the dispatcher can route and resume CLI sessions.
+2. **Populate the bridge-runtime fields.** `session_name` / `a2a_call_id` come from your IM's own metadata; `session_id` is a **CLI resume id**, so read it from the bridge-local `transport::session_store::SessionStore` (`pub(crate)`, key `(transport, your conversation key)` — e.g. the chat id) and write the reply's `cli_session_id` back in `send_reply` **before any early return**: a streaming turn's persist-only reply carries an empty `text` plus a `cli_session_id`, and dropping it loses the session for the whole conversation. Never pass your IM conversation id to the CLI as a resume id — agentproc renders it as `--resume <id>` and the CLI then fails on every turn. The store lives in this process only, so a bridge restart starts fresh CLI sessions for non-iLink channels (iLink keeps persisting through the Hub). If your IM's reply token is per-message rather than per-conversation (e.g. WeCom's `req_id`, which must be echoed verbatim), key the store on the stable conversation id and map the reply token back to it inside your adapter.
 3. **Register the factory** under your `transport:` kind — built-in: one `register` call in `TransportRegistry::with_builtins`; external: your own registry (see above). Keep credential/env parsing inside the adapter (`from_credentials`).
 4. **Override `send_media`** if your IM can upload attachments — use `bridge::transport::media::read_media_bytes` to fetch the bytes from `MediaRef.url` (file / http(s) / base64 data URLs). Set `capabilities().media_upload = true` so the MCP server routes `send_image` / `send_file` / `send_voice` calls to you.
 5. **Carry IM-private data** in `InboundMessage.extra` rather than bloating the main DTO; keep `raw` as the full original message for diagnostics.
