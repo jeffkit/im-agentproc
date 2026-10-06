@@ -10,8 +10,11 @@
 //! - `session_id` / `session_name` / `a2a_call_id` are **bridge-runtime**
 //!   fields, not IM-protocol fields. They are first-class on the DTOs because
 //!   the dispatcher needs them for routing and CLI session continuity. For the
-//!   iLink-via-Hub adapter they are populated from `HubExt`; a direct or non-
-//!   iLink adapter populates them from its own conversation identifiers.
+//!   iLink-via-Hub adapter they are populated from `HubExt`; a non-iLink
+//!   adapter reads `session_id` from its own [`session_store::SessionStore`]
+//!   (keyed by `(transport, adapter conversation key)`, `None` on the first
+//!   turn) — it must **not** hand the IM conversation id to the CLI as a
+//!   resume id.
 //! - `extra` carries IM-private data so the main DTO does not bloat. `raw`
 //!   holds the full original message as JSON for diagnostics.
 //! - Media upload / typing / read-receipts are NOT modelled yet (Q4/Q5): media
@@ -27,6 +30,7 @@ pub(crate) mod feishu;
 pub(crate) mod ilink;
 pub(crate) mod media;
 pub mod registry;
+pub(crate) mod session_store;
 pub(crate) mod telegram;
 pub(crate) mod wecom;
 
@@ -135,7 +139,9 @@ pub struct InboundMessage {
     pub text: Option<String>,
     /// Media attachments carried by the message.
     pub media: Vec<MediaRef>,
-    /// Bridge-runtime: the active CLI session id to resume (iLink `HubExt.session_id`).
+    /// Bridge-runtime: the active CLI session id to resume (iLink
+    /// `HubExt.session_id`; non-iLink adapters read it from the local
+    /// `session_store`, `None` on the first turn of a conversation).
     pub session_id: Option<String>,
     /// Bridge-runtime: human-readable session name, used as the dispatch key
     /// and echoed on outbound for footer routing (iLink `HubExt.session_name`).

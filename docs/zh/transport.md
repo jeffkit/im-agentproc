@@ -16,7 +16,7 @@ bridge 的核心 dispatcher 只认**通用 IM DTO**。每个具体 IM 协议（�
                  └──────────────────────────────────────────┘
 ```
 
-dispatcher 永远看不到 IM 协议专属类型。`session_id` / `session_name` / `a2a_call_id` 是 **bridge 运行时**字段，在 DTO 上一等公民，因为 dispatcher 需要它们做路由和 CLI 会话续接——由适配器填充（iLink-via-Hub 适配器从 `HubExt` 填；其它 IM 从各自会话标识填）。
+dispatcher 永远看不到 IM 协议专属类型。`session_id` / `session_name` / `a2a_call_id` 是 **bridge 运行时**字段，在 DTO 上一等公民，因为 dispatcher 需要它们做路由和 CLI 会话续接——由适配器填充：iLink-via-Hub 适配器从 `HubExt` 填；其它适配器从 bridge 进程内的 `transport::session_store::SessionStore` 填（键为 `(transport, 适配器定义的会话键)`，首轮为空）。适配器**绝不能**把自己的 IM 会话 id（chat_id / channel_id）当 resume id 交给 CLI。
 
 ## `Transport` trait
 
@@ -44,7 +44,7 @@ pub trait Transport: Send + Sync {
 | 类型 | 角色 |
 |------|------|
 | `InboundOutcome` | `Messages(Vec<InboundMessage>)` 或 `TokenRejected`（401/吊销 → 重新注册）。 |
-| `InboundMessage` | `context_token`、`from_user`、`is_from_bot`、`text`、`media: Vec<MediaRef>`、`session_id`、`session_name`、`a2a_call_id`、`extra`（IM 私有）、`raw`（完整原始 JSON，诊断用）。 |
+| `InboundMessage` | `context_token`、`from_user`、`is_from_bot`、`text`、`media: Vec<MediaRef>`、`session_id`（CLI 续接号：iLink 取 `HubExt.session_id`；非 iLink 取本地 store，首轮为 `None`）、`session_name`、`a2a_call_id`、`extra`（IM 私有）、`raw`（完整原始 JSON，诊断用）。 |
 | `OutboundReply` | `context_token`、`text`、`to_user`、`cli_session_id`、`session_name`、`a2a_call_id`、`usage`。 |
 | `SendOutcome` | `Sent`、`Throttled { ret, errmsg }`（退避重试）、`Rejected { ret, errmsg }`（确定性拒绝——不重试，由 dispatcher 把该段降级为半长分片）。 |
 | `TransportCapabilities` | `media_upload: bool`、`max_text_len: Option<usize>`（`None` = adapter 未声明客户端可见的通道上限，分片只受 profile 的 `max_reply_chars` 约束）。typing / 已读回执延后——Q5。 |
@@ -59,7 +59,7 @@ pub trait Transport: Send + Sync {
 ## 新增一个 IM（飞书 / Telegram / …）
 
 1. 在 `src/bridge/transport/` 下新子模块里为你的 IM **实现 `Transport`**。把你的 IM 入站 webhook/poll 事件翻译成 `InboundMessage`，把出站发送从 `OutboundReply` 翻译过去。
-2. 从你的 IM 会话标识**填充 bridge 运行时字段**（`session_id`、`session_name`、`a2a_call_id`），让 dispatcher 能路由和续接 CLI 会话。
+2. **填充 bridge 运行时字段**。`session_name` / `a2a_call_id` 取你 IM 自己的元数据；`session_id` 是 **CLI 续接号**，从 bridge 进程内的 `transport::session_store::SessionStore` 读（`pub(crate)`，键为 `(transport, 你定义的会话键)`，如 chat_id），并在 `send_reply` 里把回包的 `cli_session_id` 写回 store——**必须放在任何提前返回之前**：流式回复的「仅持久化」回包正文为空但带 `cli_session_id`，放过了就会整轮丢号。绝不把自己的 IM 会话 id 当 resume id 交给 CLI（agentproc 会拼成 `--resume <id>`，CLI 每轮都失败）。store 只存活于本进程：bridge 重启后非 iLink 通道从冷会话开始（iLink 仍由 Hub 持久化）。若你 IM 的回复 token 是逐条而非逐会话的（如 WeCom 的 `req_id`，必须逐字回填），store 键用稳定的会话 id，并在适配器内把回复 token 反查回会话键。
 3. 在 `build_transport`（`src/bin/im-agentproc.rs`）里**接工厂**，`transport:` 匹配你的 IM 名时构造你的适配器。
 4. **声明能力**——仅当你的 IM 能为出站回复上传媒体时设 `media_upload: true`。
 5. **IM 私有数据**放 `InboundMessage.extra`，别撑大主 DTO；`raw` 保留完整原始消息供诊断。

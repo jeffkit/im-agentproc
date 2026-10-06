@@ -14,6 +14,7 @@
 //! downloaded to temp files and forwarded as `MediaRef` attachments.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -22,6 +23,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use super::media::download_to_temp;
+use super::session_store::SessionStore;
 use super::{
     InboundMessage, InboundOutcome, MediaOut, MediaRef, OutboundReply, SendOutcome, Transport,
     TransportCapabilities,
@@ -158,6 +160,8 @@ pub struct TelegramTransport {
     http: reqwest::Client,
     token: String,
     base_url: String,
+    /// `(transport, chat_id) → cli_session_id`，由本进程的 `send_reply` 回填。
+    sessions: Arc<SessionStore>,
 }
 
 impl TelegramTransport {
@@ -199,6 +203,7 @@ impl TelegramTransport {
             http,
             token,
             base_url,
+            sessions: Arc::new(SessionStore::new()),
         })
     }
 
@@ -369,6 +374,7 @@ impl TelegramTransport {
         let from_user = msg.from.as_ref().map(|u| u.id.to_string());
         let session_name = chat_name(&msg.chat);
         let extra = serde_json::json!({ "update_id": update.update_id });
+        let session_id = self.sessions.lookup("telegram", &chat_id.to_string());
 
         Some(InboundMessage {
             context_token: Some(chat_id.to_string()),
@@ -376,7 +382,7 @@ impl TelegramTransport {
             is_from_bot,
             text,
             media,
-            session_id: None,
+            session_id,
             session_name,
             a2a_call_id: None,
             extra,
@@ -459,6 +465,14 @@ impl Transport for TelegramTransport {
                 .trim()
                 .parse()
                 .context("Telegram context_token must be a chat_id integer")?;
+            // Persist before the empty-text early return: a streaming turn's
+            // "persist-only" reply has an empty body + a `cli_session_id`, and
+            // dropping it would lose the session for the whole conversation.
+            self.sessions.remember(
+                "telegram",
+                &reply.context_token,
+                reply.cli_session_id.as_deref(),
+            );
             if reply.text.trim().is_empty() {
                 return Ok(SendOutcome::Sent);
             }

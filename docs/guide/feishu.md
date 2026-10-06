@@ -76,7 +76,7 @@ The bridge connects to Feishu's WebSocket gateway and starts receiving messages.
 - **Supported message types**: `text`, `image`, `file`, `audio`. Other types are silently dropped.
 - **Media handling**: Images, files and audio are downloaded to local temp files via `GET /open-apis/im/v1/messages/{id}/resources/{key}?type=image|file`. The local path is forwarded to the agent as a `file://` URL in `MediaRef`. Media-only messages (no text) get a placeholder like `[image]` so the agent processes them.
 - **Anti-loop**: Messages with `sender_type: bot` are skipped.
-- **Session ID** is the `chat_id` of the Feishu conversation, providing independent CLI session continuity per chat.
+- **Session continuity**: the CLI resume id comes from the bridge's in-process session store, keyed by the Feishu `chat_id` (the `chat_id` itself only routes replies), giving each chat its own CLI session; a bridge restart starts a fresh CLI session.
 - **Auto-reconnect**: The WS client has `auto_reconnect=true` and handles reconnections internally.
 - **Token management**: `tenant_access_token` is refreshed automatically (5 min before expiry) and shared between the event handler and the send path.
 

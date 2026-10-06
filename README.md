@@ -60,7 +60,7 @@ The bridge auto-registers with the Hub (no QR scan by default), gets a virtual t
 - **In-process executors** — set `executor: claude-code` (etc.) and the agentproc SDK drives the CLI directly, no bridge-subprocess fork.
 - **Pluggable `Transport` trait** — the dispatcher speaks only generic IM DTOs; iLink is the only real adapter today, Feishu / Telegram / … land as new `Transport` implementations.
 - **Safe by construction** — shell-`-c` + `{{MESSAGE}}` injection is rejected at load time; the message always travels via the stdin turn object.
-- **Session continuity** — CLI `session_id` is persisted on the Hub and resumed on the next turn (`via: hub`).
+- **Session continuity** — CLI `session_id` is persisted on the Hub and resumed on the next turn (`via: hub`); Telegram / WeCom / Feishu / Discord resume from the bridge's in-process session store, so a bridge restart starts a fresh CLI session there.
 
 ## Documentation
 
