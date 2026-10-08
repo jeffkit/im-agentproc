@@ -16,13 +16,13 @@ hero:
 features:
   - icon: 💬
     title: IM → AgentProc，一条消息一次运行
-    description: 把 IM 传输（当前 iLink/微信）桥接到 agentproc profile。每条入站文本消息驱动一次 agentproc profile 运行，并跨轮保持 CLI 会话续接。
+    description: 把 IM 传输（iLink/微信、Telegram、WeCom、飞书、Discord）桥接到 agentproc profile。每条入站文本消息驱动一次 agentproc profile 运行，并跨轮保持 CLI 会话续接。
   - icon: 🔌
     title: iLink Hub 的虚拟 token 后端
     description: 通过 /hub/register 注册为 iLink Hub 的后端，拿到虚拟 token，长轮询入站消息——无需手动申请 bot_token。
   - icon: 🧩
     title: 可插拔的 Transport trait
-    description: dispatcher 只认通用 IM DTO。当前只有 iLink 一个真实适配器；飞书 / Telegram / …… 作为新的 Transport 实现接入，无需改动 dispatcher。
+    description: dispatcher 只认通用 IM DTO。仓内已内置五个适配器（iLink/微信、Telegram、WeCom、飞书、Discord）；更多 IM 作为新的 Transport 实现接入，无需改动 dispatcher。
   - icon: 🤖
     title: 内置 P0 exec profile
     description: 内置 claude-code、codex、cursor、codebuddy-code、agy、recursive 处理器——每个都遵循 agentproc 0.4 agent 协议（stdin turn → stdout NDJSON）。

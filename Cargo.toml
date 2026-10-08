@@ -2,7 +2,7 @@
 name = "im-agentproc"
 version = "0.3.0"
 edition = "2021"
-description = "IM-side runtime for the agentproc ecosystem: bridge an IM transport (iLink/WeChat today) to local coding CLIs (Claude Code, Codex, …) via agentproc profiles."
+description = "IM-side runtime for the agentproc ecosystem: bridge an IM transport (iLink/WeChat, Telegram, WeCom, Feishu, Discord) to local coding CLIs (Claude Code, Codex, …) via agentproc profiles."
 license = "MIT"
 authors = ["jeffkit <bbmyth@gmail.com>"]
 repository = "https://github.com/jeffkit/im-agentproc"

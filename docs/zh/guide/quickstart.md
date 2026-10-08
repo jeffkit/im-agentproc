@@ -115,6 +115,6 @@ manager 每 5s 扫一次 `~/.ilink-hub-bridge/profiles`，每个 YAML 起一个�
 | `CLI 认证失败` | CLI 自己的鉴权过期（如 `claude` 登出）。重新登录 CLI 并重启 bridge。 |
 | 自动注册 HTTP 401 | Hub 开了 admin 鉴权。在 bridge 环境设 `ILINK_ADMIN_TOKEN`（与 Hub 一致）。 |
 | `via: direct 需要显式 base_url` | direct 模式拒绝 localhost Hub 默认值。在 YAML 设 `base_url:` 或非默认 `WEIXIN_BASE_URL`。 |
-| `transport … 没有真实适配器` | 你把 `transport:` 设成了 `ilink` 以外的值。当前只实现了 `ilink`；可插拔冒烟测试请加 `--allow-null-transport`。 |
+| `transport … 没有真实适配器` | 你把 `transport:` 设成了没有注册适配器的 kind。内置值为 `ilink`、`telegram`、`wecom`、`feishu`、`discord`；仅在做可插拔冒烟测试时加 `--allow-null-transport`。 |
 
 下一篇：[配置参考](/zh/guide/configuration) →

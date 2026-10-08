@@ -18,7 +18,7 @@ im-agentproc [全局 flags] [子命令]
 | `--pair` | — | `false` | 忽略保存凭证，跑扫码配对（手机确认）。 |
 | `--register-name <n>` | `ILINKHUB_BRIDGE_REGISTER_NAME` | `local-<host>-<stem>` | 自动注册时的稳定 client 名。 |
 | `--force-register` | — | `false` | 凭证文件存在但无效/为空时，删掉重新自动注册。 |
-| `--allow-null-transport` | `ILINKHUB_BRIDGE_ALLOW_NULL_TRANSPORT` | `false` | 允许非 `ilink` transport 的占位适配器（可插拔冒烟测试）。 |
+| `--allow-null-transport` | `ILINKHUB_BRIDGE_ALLOW_NULL_TRANSPORT` | `false` | 允许未注册 transport kind 的占位适配器（可插拔冒烟测试）。 |
 | `--no-interactive` | `ILINKHUB_BRIDGE_NON_INTERACTIVE` | `false` | 关闭扫码流程。stdout 非 TTY 时 `via: direct` 直接 bail。 |
 | `--config <path>` | — | `~/.ilink-hub/ilink-hub-bridge.yaml` | bridge YAML 路径。仅默认模式。 |
 | `--version` | — | — | 打印版本并退出。 |

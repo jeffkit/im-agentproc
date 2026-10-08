@@ -16,13 +16,13 @@ hero:
 features:
   - icon: 💬
     title: IM → AgentProc, one message one run
-    description: Connects an IM transport (iLink/WeChat today) to agentproc profiles. Every inbound text message drives exactly one agentproc profile run, with CLI session continuity across turns.
+    description: Connects an IM transport (iLink/WeChat, Telegram, WeCom, Feishu and Discord) to agentproc profiles. Every inbound text message drives exactly one agentproc profile run, with CLI session continuity across turns.
   - icon: 🔌
     title: Virtual-token backend for iLink Hub
     description: Registers as a backend of iLink Hub via /hub/register, gets a virtual token, and long-polls inbound messages — no manual bot_token provisioning.
   - icon: 🧩
     title: Pluggable Transport trait
-    description: The dispatcher speaks only generic IM DTOs. iLink is the only real adapter today; Feishu / Telegram / … land as new Transport implementations without touching the dispatcher.
+    description: The dispatcher speaks only generic IM DTOs. Five adapters ship in-tree (iLink/WeChat, Telegram, WeCom, Feishu, Discord); further IMs land as new Transport implementations without touching the dispatcher.
   - icon: 🤖
     title: Built-in P0 exec profiles
     description: Ships built-in handlers for claude-code, codex, cursor, codebuddy-code, agy, recursive — each follows the agentproc 0.4 agent contract (stdin turn → stdout NDJSON).

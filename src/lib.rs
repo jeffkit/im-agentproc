@@ -1,8 +1,8 @@
 //! im-agentproc — IM-side runtime for the agentproc ecosystem.
 //!
-//! Connects an IM transport (iLink/WeChat today; more IMs via the `Transport`
-//! trait later) to agentproc profiles: one inbound IM text message → one
-//! agentproc profile run.
+//! Connects an IM transport (iLink/WeChat, Telegram, WeCom, Feishu and Discord
+//! today; more IMs via the `Transport` trait later) to agentproc profiles: one
+//! inbound IM text message → one agentproc profile run.
 //!
 //! Extracted from `ilink-hub`'s `src/bridge/` subtree; see
 //! `docs/proposals/bridge-as-multi-im-runtime.md` (Appendix A) for the split
