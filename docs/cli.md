@@ -18,7 +18,7 @@ With no subcommand, the binary runs in default bridge mode.
 | `--pair` | — | `false` | Ignore saved creds and run QR pairing (phone confirm). |
 | `--register-name <n>` | `ILINKHUB_BRIDGE_REGISTER_NAME` | `local-<host>-<stem>` | Stable client name when auto-registering via `/hub/register`. |
 | `--force-register` | — | `false` | If the cred file exists but is invalid/empty, delete it and auto-register again. |
-| `--allow-null-transport` | `ILINKHUB_BRIDGE_ALLOW_NULL_TRANSPORT` | `false` | Allow a non-`ilink` transport's placeholder adapter (pluggability smoke test). |
+| `--allow-null-transport` | `ILINKHUB_BRIDGE_ALLOW_NULL_TRANSPORT` | `false` | Allow an unregistered transport kind's placeholder adapter (pluggability smoke test). |
 | `--no-interactive` | `ILINKHUB_BRIDGE_NON_INTERACTIVE` | `false` | Disable QR flows. `via: direct` bails instead of printing a QR when stdout is not a TTY. |
 | `--config <path>` | — | `~/.ilink-hub/ilink-hub-bridge.yaml` | Bridge YAML path. Default mode only. |
 | `--version` | — | — | Print version and exit. |

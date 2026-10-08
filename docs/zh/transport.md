@@ -76,4 +76,4 @@ dispatcher、profile runner、会话处理、防循环、错误路径全部 IM �
 
 ## 为什么 `NullTransport` 快速失败
 
-一个永远返回"未实现"的占位，否则会让 dispatcher 永久退避，看着像僵尸进程。所以 bridge 拒绝启动非 `ilink` transport，除非你传 `--allow-null-transport`（或设 `ILINKHUB_BRIDGE_ALLOW_NULL_TRANSPORT=1`），让可插拔冒烟测试是显式的，而非意外误配。
+一个永远返回"未实现"的占位，否则会让 dispatcher 永久退避，看着像僵尸进程。所以 bridge 拒绝启动没有注册 factory 的 transport kind，除非你传 `--allow-null-transport`（或设 `ILINKHUB_BRIDGE_ALLOW_NULL_TRANSPORT=1`），让可插拔冒烟测试是显式的，而非意外误配。

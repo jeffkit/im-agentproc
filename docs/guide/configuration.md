@@ -104,7 +104,7 @@ These are read by the `im-agentproc` binary, not the profile:
 | `ILINKHUB_BRIDGE_CREDS` | Override the credential JSON path. |
 | `ILINKHUB_BRIDGE_REGISTER_NAME` | Stable client name when auto-registering. Default `local-<hostname>-<config-stem>`. |
 | `ILINKHUB_BRIDGE_NON_INTERACTIVE` | Disable QR flows; `via: direct` bails instead of printing a QR when stdout is not a TTY. Injected by the manager into children. |
-| `ILINKHUB_BRIDGE_ALLOW_NULL_TRANSPORT` | Allow a non-`ilink` transport's placeholder adapter. |
+| `ILINKHUB_BRIDGE_ALLOW_NULL_TRANSPORT` | Allow an unregistered transport kind's placeholder adapter. |
 | `ILINKHUB_BRIDGE_DUMP_MSG` | `1`/`true`/`yes` → dump every inbound `WeixinMessage` JSON + `item_list[*].extra` to stderr. |
 | `ILINK_ADMIN_TOKEN` | Hub admin auth token; must match the Hub when it enforces admin auth. Propagates to manager children. |
 | `RUST_LOG` / `im_agentproc=info` | Tracing filter. |

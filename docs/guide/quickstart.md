@@ -115,6 +115,6 @@ The manager scans `~/.ilink-hub-bridge/profiles` every 5s, spawns one child brid
 | `CLI 认证失败` | The CLI's own auth expired (e.g. `claude` logged out). Re-login to the CLI and restart the bridge. |
 | HTTP 401 on auto-register | The Hub enforces admin auth. Set `ILINK_ADMIN_TOKEN` (matching the Hub) in the bridge environment. |
 | `via: direct 需要显式 base_url` | Direct mode refuses the localhost Hub default. Set `base_url:` in the YAML or a non-default `WEIXIN_BASE_URL`. |
-| `transport … 没有真实适配器` | You set `transport:` to something other than `ilink`. Only `ilink` is implemented today; add `--allow-null-transport` for a pluggability smoke test. |
+| `transport … 没有真实适配器` | You set `transport:` to a kind with no registered adapter. The built-ins are `ilink`, `telegram`, `wecom`, `feishu` and `discord`; add `--allow-null-transport` only for a pluggability smoke test. |
 
 Next: [Configuration](/guide/configuration) →

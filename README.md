@@ -1,6 +1,6 @@
 # IM-AgentProc
 
-> IM-side runtime for the [agentproc](https://agentproc.dev) ecosystem — bridge an IM transport (iLink/WeChat today; more IMs via the `Transport` trait later) to local coding CLIs (Claude Code, Codex, Cursor, …) via agentproc profiles.
+> IM-side runtime for the [agentproc](https://agentproc.dev) ecosystem — bridge an IM transport (iLink/WeChat, Telegram, WeCom, Feishu and Discord today; more IMs via the `Transport` trait later) to local coding CLIs (Claude Code, Codex, Cursor, …) via agentproc profiles.
 >
 > **One inbound IM message → one agentproc profile run.**
 
@@ -58,7 +58,7 @@ The bridge auto-registers with the Hub (no QR scan by default), gets a virtual t
 
 - **Pure agentproc P0 profiles** — `stdin` turn object, `stdout` NDJSON events. No bridge-specific `type:` shortcuts.
 - **In-process executors** — set `executor: claude-code` (etc.) and the agentproc SDK drives the CLI directly, no bridge-subprocess fork.
-- **Pluggable `Transport` trait** — the dispatcher speaks only generic IM DTOs; iLink is the only real adapter today, Feishu / Telegram / … land as new `Transport` implementations.
+- **Pluggable `Transport` trait** — the dispatcher speaks only generic IM DTOs; five adapters ship in-tree (iLink/WeChat, Telegram, WeCom, Feishu, Discord), and further IMs land as new `Transport` implementations without touching the dispatcher.
 - **Safe by construction** — shell-`-c` + `{{MESSAGE}}` injection is rejected at load time; the message always travels via the stdin turn object.
 - **Session continuity** — CLI `session_id` is persisted on the Hub and resumed on the next turn (`via: hub`); Telegram / WeCom / Feishu / Discord resume from a per-profile session file (`<profile>.sessions.json`, next to the profile YAML), so a bridge restart keeps the CLI session there too.
 

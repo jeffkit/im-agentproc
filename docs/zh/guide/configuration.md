@@ -7,7 +7,7 @@ bridge profile 是**一个 YAML 文件 == 一个 agentproc profile**，采用 sp
 ```yaml
 description: issue-keeper on MiniMax          # 经 Hub MCP list_agents 工具暴露
 script: ./my-handler.py                       # 可选简写（展开成 command/args）
-transport: ilink                              # 默认；当前只实现 ilink
+transport: ilink                              # 默认；ilink | telegram | wecom | feishu | discord
 via: hub                                      # 默认；或 `direct` 跳过 Hub
 base_url: https://ilinkai.weixin.qq.com       # 仅 `via: direct` 用
 agentproc:
@@ -37,7 +37,7 @@ agentproc:
 |------|------|------|
 | `description` | — | 人类可读的 agent 描述。经 Hub MCP `list_agents` 工具暴露，让其它 agent 能发现此后端能力。 |
 | `script` | — | 简写：按扩展名展开成 `command`/`args` 的脚本路径。显式 `agentproc.command` 永远优先。 |
-| `transport` | `ilink` | IM 协议。只实现了 `ilink`；其它任意字符串加载 `NullTransport` 占位（需 `--allow-null-transport`）。 |
+| `transport` | `ilink` | IM 协议。支持的值：`ilink`、`telegram`、`wecom`、`feishu`、`discord`。任何无法识别的字符串会加载 `NullTransport` 占位（需 `--allow-null-transport`）。 |
 | `via` | `hub` | 凭证/连接模式。`hub` 经 Hub 解析虚拟 token；`direct` 直连真实 iLink 上游。 |
 | `base_url` | — | `via: direct` 的真实 iLink 上游 URL（如 `https://ilinkai.weixin.qq.com`）。覆盖 `--hub-url`/`WEIXIN_BASE_URL`。`via: hub` 时忽略。 |
 | `agentproc` | — | 纯 agentproc profile 块（见下）。 |
@@ -102,7 +102,7 @@ agentproc:
 | `ILINKHUB_BRIDGE_CREDS` | 覆盖凭证 JSON 路径。 |
 | `ILINKHUB_BRIDGE_REGISTER_NAME` | 自动注册时的稳定 client 名。默认 `local-<hostname>-<config-stem>`。 |
 | `ILINKHUB_BRIDGE_NON_INTERACTIVE` | 关闭扫码流程；stdout 非 TTY 时 `via: direct` 直接 bail 而非打印二维码。manager 注入给子进程。 |
-| `ILINKHUB_BRIDGE_ALLOW_NULL_TRANSPORT` | 允许非 `ilink` transport 的占位适配器。 |
+| `ILINKHUB_BRIDGE_ALLOW_NULL_TRANSPORT` | 允许未注册 transport kind 的占位适配器。 |
 | `ILINKHUB_BRIDGE_DUMP_MSG` | `1`/`true`/`yes` → 把每条入站 `WeixinMessage` JSON + `item_list[*].extra` 打到 stderr。 |
 | `ILINK_ADMIN_TOKEN` | Hub admin 鉴权 token；Hub 开 admin 鉴权时须与 Hub 一致。会传给 manager 子进程。 |
 | `RUST_LOG` / `im_agentproc=info` | tracing 过滤。 |
