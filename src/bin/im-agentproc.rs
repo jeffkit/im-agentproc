@@ -23,12 +23,9 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use tracing::info;
 
-
 use im_agentproc::bridge::transport::registry::{TransportBuildCtx, TransportRegistry};
 use im_agentproc::bridge::transport::Transport;
-use im_agentproc::bridge::{
-    builtin, BridgeApp, Via,
-};
+use im_agentproc::bridge::{builtin, BridgeApp, Via};
 use im_agentproc::mcp::{
     run_server, OutboundDelivery, SendFileTool, SendImageTool, SendTextTool, SendVoiceTool,
     ServerConfig, ToolRegistry,
@@ -170,7 +167,6 @@ fn explicit_token(cli: &Cli) -> Option<&str> {
 }
 
 use im_agentproc::bridge::transport::registry::DEFAULT_HUB_URL;
-
 
 /// Launch the outbound-media MCP stdio server as a sub-process entrypoint.
 ///
@@ -469,13 +465,6 @@ mod tests {
         assert!(!cli.no_interactive);
     }
 
-
-
-
-
-
-
-
     // ── resolve_mcp_transport env-var wiring ─────────────────────────────────
     // We serialise on the same ENV_LOCK + clear_im_credential_env helper used
     // by the factory tests so concurrent runs can't race on env reads.
@@ -559,6 +548,4 @@ mod tests {
         assert_eq!(transport.name(), "discord");
         assert!(transport.capabilities().media_upload);
     }
-
-
 }

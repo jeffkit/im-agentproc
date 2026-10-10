@@ -65,8 +65,11 @@ pub struct TransportBuildCtx {
 }
 
 /// Async factory building a transport for the given context.
-pub type TransportFactory =
-    Arc<dyn for<'a> Fn(&'a TransportBuildCtx) -> BoxFuture<'a, Result<Arc<dyn Transport>>> + Send + Sync>;
+pub type TransportFactory = Arc<
+    dyn for<'a> Fn(&'a TransportBuildCtx) -> BoxFuture<'a, Result<Arc<dyn Transport>>>
+        + Send
+        + Sync,
+>;
 
 /// Registry mapping `transport:` kind strings to factories.
 #[derive(Default)]
@@ -383,8 +386,8 @@ mod tests {
 
     #[test]
     fn direct_base_url_guards_match_m2_contract() {
-        let base =
-            resolve_direct_base_url(Some("https://ilinkai.weixin.qq.com"), DEFAULT_HUB_URL).unwrap();
+        let base = resolve_direct_base_url(Some("https://ilinkai.weixin.qq.com"), DEFAULT_HUB_URL)
+            .unwrap();
         assert_eq!(base, "https://ilinkai.weixin.qq.com");
         let err = resolve_direct_base_url(Some("   "), "https://up.example.com").unwrap_err();
         assert!(format!("{err:#}").contains("empty"));

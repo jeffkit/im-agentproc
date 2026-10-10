@@ -1,9 +1,10 @@
-//! `[wip]` repro tests for issue #6 — delivery semantics ("take-and-ack"
-//! loses user messages on crash / queue overflow / retry exhaustion, and the
-//! Telegram offset only lives in memory).
+//! End-to-end tests for issue #6 — delivery semantics: a message is durably
+//! recorded before dispatch, redelivered after a crash, and never answered
+//! twice; the Telegram `getUpdates` offset survives a restart and filters
+//! re-delivered updates.
 //!
-//! These are *investigation* tests: they pin the acceptance criteria and FAIL
-//! against the current tree. They must keep passing once the fix lands.
+//! (Originally landed as `tests/[wip]_issue6_delivery.rs`; the brackets made the
+//! file an invalid cargo test target name, so it was renamed to build.)
 //!
 //! Acceptance clauses covered here (integration level, public API only):
 //!   1. inbound message is durably recorded BEFORE dispatch, and is redelivered
@@ -14,8 +15,8 @@
 //!      cursor; a re-delivered `update_id` is de-duplicated.
 //!
 //! In-crate unit coverage (needs `pub(crate)`/`pub(super)` seams) lives in
-//! `src/bridge/dispatcher/tests.rs` (`wip_*`) and the Telegram transport test
-//! module.
+//! `src/bridge/dispatcher/tests.rs` (`wip_*`), `src/bridge/dispatcher/wal.rs`
+//! and the Telegram transport test module.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -157,7 +158,10 @@ impl MockTransport {
 }
 
 impl Transport for MockTransport {
-    fn next_inbound<'a>(&'a self, _buf: &'a mut String) -> BoxFuture<'a, anyhow::Result<InboundOutcome>> {
+    fn next_inbound<'a>(
+        &'a self,
+        _buf: &'a mut String,
+    ) -> BoxFuture<'a, anyhow::Result<InboundOutcome>> {
         Box::pin(async move {
             let drained: Vec<InboundMessage> = {
                 let mut queue = self.inbound.lock().expect("inbound poisoned");
@@ -171,7 +175,10 @@ impl Transport for MockTransport {
         })
     }
 
-    fn send_reply<'a>(&'a self, reply: OutboundReply) -> BoxFuture<'a, anyhow::Result<SendOutcome>> {
+    fn send_reply<'a>(
+        &'a self,
+        reply: OutboundReply,
+    ) -> BoxFuture<'a, anyhow::Result<SendOutcome>> {
         let attempt = self.send_attempts.fetch_add(1, Ordering::SeqCst);
         self.replies.lock().expect("replies poisoned").push(reply);
         let block = self.block_first_send && attempt == 0;
@@ -287,9 +294,11 @@ fn wip_crashed_message_is_redelivered_after_restart_and_not_replayed_once_answer
             app.clone(),
             shutdown1.clone(),
         ));
-        wait_until("reply attempt #1 (message dispatched, send parked)", Duration::from_secs(20), || {
-            run1.send_attempts() >= 1
-        })
+        wait_until(
+            "reply attempt #1 (message dispatched, send parked)",
+            Duration::from_secs(20),
+            || run1.send_attempts() >= 1,
+        )
         .await;
         let mut wal_hits = files_containing(home.path(), "ctx-wal");
         wal_hits.extend(files_containing(wal_env.path(), "ctx-wal"));
@@ -346,18 +355,18 @@ fn wip_crashed_message_is_redelivered_after_restart_and_not_replayed_once_answer
     let (wal_hits, redelivered, replayed) = outcome;
     assert!(
         !wal_hits.is_empty(),
-        "[wip] issue #6 acceptance 1: the inbound message must be durably written \
+        "issue #6 acceptance 1: the inbound message must be durably written \
          (WAL/log) BEFORE dispatch, so a kill between dispatch and reply cannot lose it; \
          no file under $HOME contains the pending context token `ctx-wal`"
     );
     assert!(
         redelivered,
-        "[wip] issue #6 acceptance 1: a message killed after dispatch and before the reply \
+        "issue #6 acceptance 1: a message killed after dispatch and before the reply \
          must be redelivered after restart; run 2 never answered `ctx-wal`"
     );
     assert_eq!(
         replayed, 0,
-        "[wip] issue #6 acceptance 1: a WAL entry whose reply succeeded must be deleted/marked \
+        "issue #6 acceptance 1: a WAL entry whose reply succeeded must be deleted/marked \
          done — run 3 replayed a completed message"
     );
 }
@@ -432,13 +441,8 @@ fn wip_telegram_offset_is_persisted_and_resumed_by_a_rebuilt_transport() {
         let resumed = rebuilt.next_inbound(&mut fresh_buf).await.is_ok();
 
         offset_zero.assert_async().await;
-        let resumed_called = offset_resumed.expect(1).assert_async().await;
-        (
-            first_delivered,
-            resumed,
-            resumed_called.is_ok(),
-            fresh_buf.clone(),
-        )
+        let resumed_called = offset_resumed.expect(1).matched_async().await;
+        (first_delivered, resumed, resumed_called, fresh_buf.clone())
     });
 
     match previous_home {
@@ -450,12 +454,12 @@ fn wip_telegram_offset_is_persisted_and_resumed_by_a_rebuilt_transport() {
     assert!(first_delivered, "poll #1 must deliver update_id 42");
     assert!(
         resumed,
-        "[wip] issue #6 acceptance 4: the restart poll must succeed by resuming the \
+        "issue #6 acceptance 4: the restart poll must succeed by resuming the \
          persisted offset (43); it failed"
     );
     assert!(
         resumed_called,
-        "[wip] issue #6 acceptance 4: after a restart the transport must poll getUpdates with \
+        "issue #6 acceptance 4: after a restart the transport must poll getUpdates with \
          the persisted offset 43 (it must not resolve the offset from the in-memory buf, which \
          is empty on restart); the offset=43 request was never made (fresh buf = {fresh_buf:?})"
     );
@@ -506,7 +510,7 @@ fn wip_telegram_duplicate_update_id_is_dropped_on_repoll() {
     assert_eq!(first_count, 1, "poll #1 must deliver the fresh update");
     assert_eq!(
         second_count, 0,
-        "[wip] issue #6 acceptance 4: a re-delivered update_id (42) must be de-duplicated — the \
+        "issue #6 acceptance 4: a re-delivered update_id (42) must be de-duplicated — the \
          dispatcher must not run the CLI twice for one user message"
     );
 }

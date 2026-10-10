@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::bridge::config::BridgeApp;
 use crate::bridge::transport::{IlinkTransport, InboundOutcome, Transport};
@@ -12,8 +12,10 @@ mod backoff;
 mod handle;
 pub(crate) mod send;
 mod session;
+mod wal;
 
 use session::SessionDispatcher;
+use wal::Wal;
 
 #[cfg(test)]
 use backoff::{backoff_for, backoff_for_test, MAX_BACKOFF_SECS};
@@ -46,15 +48,30 @@ pub async fn run_bridge_with_shutdown(
     let client = transport;
     let app = Arc::new(app);
     let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(None::<BridgeStop>);
-    let dispatcher = Arc::new(SessionDispatcher::new(
-        client.clone(),
-        Arc::clone(&app),
-        stop_tx,
-        shutdown.clone(),
-    ));
+    // Durable inbound log, scoped to this profile: messages recorded by a run
+    // that died before answering them are replayed below.
+    let wal = Wal::open_default(app.default_profile_name());
+    let dispatcher = Arc::new(
+        SessionDispatcher::new(client.clone(), Arc::clone(&app), stop_tx, shutdown.clone())
+            .with_wal(wal.clone()),
+    );
     let mut buf = String::new();
     let mut backoff_secs: u64 = 3;
     const MAX_BACKOFF_SECS: u64 = 60;
+
+    // Reconcile with the previous run: anything it took off the transport and
+    // never answered is dispatched again (at-least-once delivery).
+    if let Some(wal) = wal.as_ref() {
+        for entry in wal.pending() {
+            warn!(
+                wal_id = %entry.id,
+                recorded_at_ms = entry.recorded_at_ms,
+                ctx = entry.message.context_token.as_deref().unwrap_or("(none)"),
+                "redelivering an unanswered message from the previous run"
+            );
+            dispatcher.replay(entry.message, entry.id);
+        }
+    }
 
     // Periodically evict closed sender entries so the senders map doesn't
     // accumulate dead entries between cap-enforcement evictions on the hot path.

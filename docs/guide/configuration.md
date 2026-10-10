@@ -106,6 +106,7 @@ These are read by the `im-agentproc` binary, not the profile:
 | `ILINKHUB_BRIDGE_NON_INTERACTIVE` | Disable QR flows; `via: direct` bails instead of printing a QR when stdout is not a TTY. Injected by the manager into children. |
 | `ILINKHUB_BRIDGE_ALLOW_NULL_TRANSPORT` | Allow a non-`ilink` transport's placeholder adapter. |
 | `ILINKHUB_BRIDGE_DUMP_MSG` | `1`/`true`/`yes` → dump every inbound `WeixinMessage` JSON + `item_list[*].extra` to stderr. |
+| `IM_AGENTPROC_WAL_DIR` | Override the root of the inbound write-ahead log (default `~/.ilink-hub-bridge/wal`, one sub-directory per profile). |
 | `ILINK_ADMIN_TOKEN` | Hub admin auth token; must match the Hub when it enforces admin auth. Propagates to manager children. |
 | `RUST_LOG` / `im_agentproc=info` | Tracing filter. |
 

@@ -104,6 +104,7 @@ agentproc:
 | `ILINKHUB_BRIDGE_NON_INTERACTIVE` | 关闭扫码流程；stdout 非 TTY 时 `via: direct` 直接 bail 而非打印二维码。manager 注入给子进程。 |
 | `ILINKHUB_BRIDGE_ALLOW_NULL_TRANSPORT` | 允许非 `ilink` transport 的占位适配器。 |
 | `ILINKHUB_BRIDGE_DUMP_MSG` | `1`/`true`/`yes` → 把每条入站 `WeixinMessage` JSON + `item_list[*].extra` 打到 stderr。 |
+| `IM_AGENTPROC_WAL_DIR` | 覆盖入站预写日志的根目录（默认 `~/.ilink-hub-bridge/wal`，每个 profile 一个子目录）。 |
 | `ILINK_ADMIN_TOKEN` | Hub admin 鉴权 token；Hub 开 admin 鉴权时须与 Hub 一致。会传给 manager 子进程。 |
 | `RUST_LOG` / `im_agentproc=info` | tracing 过滤。 |
 

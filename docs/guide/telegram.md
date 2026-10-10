@@ -55,7 +55,7 @@ Send a message to your bot in Telegram — the bridge picks it up, runs the prof
 - **Only text messages are supported** in the initial implementation. Voice, photos, documents, etc. are ignored.
 - **Anti-loop**: Messages sent by bots are dropped automatically.
 - **Group chats**: The bot must be added to the group and either mentioned or replied to directly. The `session_id` is the chat ID, so each chat is an independent session.
-- **Offset persistence**: The bridge keeps the `getUpdates` offset in memory. Restarting the bridge re-reads unacknowledged messages.
+- **Offset persistence**: The `getUpdates` offset is persisted under `~/.ilink-hub-bridge/transport-state/` (keyed by bot token), so a restart resumes where the previous run stopped instead of polling from `offset: 0`. Updates below that offset are dropped: a re-delivered batch does not re-run the CLI for a message the user already got an answer to.
 
 ## Troubleshooting
 

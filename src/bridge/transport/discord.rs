@@ -9,8 +9,8 @@
 //! Discord Gateway 文档：
 //! <https://discord.com/developers/docs/events/gateway>
 
-use std::sync::Arc;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -525,9 +525,7 @@ impl DiscordTransport {
                     .ok()
                     .filter(|s| !s.trim().is_empty())
             })
-            .context(
-                "transport: discord 需要 im_credentials.token 或环境变量 DISCORD_BOT_TOKEN",
-            )?;
+            .context("transport: discord 需要 im_credentials.token 或环境变量 DISCORD_BOT_TOKEN")?;
         Self::new(token)
     }
 

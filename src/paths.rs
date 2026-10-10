@@ -52,6 +52,23 @@ pub fn default_bridge_manager_credentials_dir() -> PathBuf {
     bridge_manager_dir().join("credentials")
 }
 
+/// Root for the per-profile inbound write-ahead log:
+/// `~/.ilink-hub-bridge/wal`.
+///
+/// One sub-directory per profile name (the manager runs one bridge process per
+/// profile), so a bridge never replays another profile's pending messages.
+/// `IM_AGENTPROC_WAL_DIR` overrides this root.
+pub fn bridge_wal_dir() -> PathBuf {
+    bridge_manager_dir().join("wal")
+}
+
+/// Directory for transport cursors that must survive a restart
+/// (`~/.ilink-hub-bridge/transport-state`), keyed by a fingerprint of the
+/// transport's own credentials.
+pub fn bridge_transport_state_dir() -> PathBuf {
+    bridge_manager_dir().join("transport-state")
+}
+
 /// Root for the desktop app's own bridge data: `~/.ilink-hub/desktop-bridge`.
 ///
 /// Kept under `~/.ilink-hub/` (alongside `desktop-port.json` and the hub DB)
@@ -127,6 +144,8 @@ mod tests {
             default_bridge_manager_credentials_dir(),
             base.join("credentials")
         );
+        assert_eq!(bridge_wal_dir(), base.join("wal"));
+        assert_eq!(bridge_transport_state_dir(), base.join("transport-state"));
     }
 
     #[test]

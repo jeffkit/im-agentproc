@@ -22,11 +22,11 @@ use serde::{Deserialize, Serialize};
 
 pub(crate) mod attachments;
 pub(crate) mod connection;
-pub mod registry;
 pub(crate) mod discord;
 pub(crate) mod feishu;
 pub(crate) mod ilink;
 pub(crate) mod media;
+pub mod registry;
 pub(crate) mod telegram;
 pub(crate) mod wecom;
 
@@ -118,7 +118,13 @@ pub struct MediaRef {
 ///
 /// Field-for-field covers everything the dispatcher reads today. IM-private
 /// data lives in `extra`; the full original message lives in `raw` for debug.
-#[derive(Debug, Clone, Default)]
+///
+/// `Serialize`/`Deserialize`: the bridge persists inbound messages to its
+/// write-ahead log before dispatching them (see `dispatcher::wal`), so a crash
+/// between "taken from the transport" and "answered" cannot lose the message.
+/// `#[serde(default)]` keeps entries written by an older/newer version loadable.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct InboundMessage {
     /// Reply-routing identifier (iLink `context_token`). Required to route a
     /// reply back to the correct conversation.

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -12,6 +12,7 @@ use crate::bridge::transport::{InboundMessage, OutboundReply, SendOutcome, Trans
 
 use super::handle::handle_one_message;
 use super::send::sanitize_errmsg;
+use super::wal::Wal;
 use super::BridgeStop;
 
 pub(super) fn session_dispatch_key(msg: &InboundMessage) -> String {
@@ -20,30 +21,112 @@ pub(super) fn session_dispatch_key(msg: &InboundMessage) -> String {
     format!("{ctx}:{session_name}")
 }
 
-pub(super) async fn run_session_worker(
+/// One dispatched message plus the WAL entry that must be dropped once its
+/// reply has landed. `wal_id` is `None` only when the message was never
+/// recorded (no WAL attached, or the write failed).
+struct Queued {
+    msg: InboundMessage,
+    wal_id: Option<String>,
+}
+
+/// The in-memory queue in front of one session worker, plus everything that no
+/// longer fits in it.
+///
+/// Overflow messages are parked in `backlog` instead of being dropped. Order is
+/// preserved because [`SessionQueue::push`] stops using the channel as soon as a
+/// backlog exists: every channel item is then older than every backlog item, so
+/// the worker may drain the channel first and still hand messages to the CLI in
+/// arrival order.
+pub(super) struct SessionQueue {
+    tx: mpsc::Sender<Queued>,
+    backlog: std::sync::Mutex<VecDeque<Queued>>,
+    notify: tokio::sync::Notify,
+}
+
+impl SessionQueue {
+    fn new(tx: mpsc::Sender<Queued>) -> Self {
+        Self {
+            tx,
+            backlog: std::sync::Mutex::new(VecDeque::new()),
+            notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    /// Never blocks and never drops: `try_send` while the backlog is empty,
+    /// otherwise append to the backlog and wake the worker.
+    fn push(&self, item: Queued) {
+        let mut backlog = self.backlog.lock().unwrap_or_else(|e| e.into_inner());
+        if !backlog.is_empty() {
+            backlog.push_back(item);
+            drop(backlog);
+            self.notify.notify_one();
+            return;
+        }
+        match self.tx.try_send(item) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(item)) => {
+                backlog.push_back(item);
+                drop(backlog);
+                self.notify.notify_one();
+            }
+            // The worker is gone; the WAL keeps the message for the next run.
+            Err(mpsc::error::TrySendError::Closed(_)) => {}
+        }
+    }
+
+    fn pop_backlog(&self) -> Option<Queued> {
+        self.backlog
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pop_front()
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_session_worker(
     key: String,
-    mut rx: mpsc::Receiver<InboundMessage>,
+    mut rx: mpsc::Receiver<Queued>,
+    queue: Arc<SessionQueue>,
     client: Arc<dyn Transport>,
     app: Arc<BridgeApp>,
     stop_tx: tokio::sync::watch::Sender<Option<BridgeStop>>,
     shutdown: CancellationToken,
+    wal: Option<Wal>,
 ) {
     const SESSION_WORKER_MAX_BACKOFF_SECS: u64 = 60;
     let mut consecutive_failures: u32 = 0;
 
     loop {
-        // Wait for next message; yield immediately if shutdown was already requested.
-        let msg = tokio::select! {
-            biased;
-            _ = shutdown.cancelled() => return,
-            msg_opt = rx.recv() => match msg_opt {
-                Some(m) => m,
-                None => {
-                    info!(session_key = %key, "session worker exiting");
-                    return;
-                }
+        // Yield immediately if shutdown was already requested: whatever is still
+        // queued stays in the WAL and is answered by the next run.
+        if shutdown.is_cancelled() {
+            return;
+        }
+        // Oldest first: the channel, then the overflow backlog. Park only when
+        // both are empty.
+        let item = match rx.try_recv() {
+            Ok(item) => item,
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                info!(session_key = %key, "session worker exiting");
+                return;
+            }
+            Err(mpsc::error::TryRecvError::Empty) => match queue.pop_backlog() {
+                Some(item) => item,
+                None => tokio::select! {
+                    biased;
+                    _ = shutdown.cancelled() => return,
+                    msg_opt = rx.recv() => match msg_opt {
+                        Some(item) => item,
+                        None => {
+                            info!(session_key = %key, "session worker exiting");
+                            return;
+                        }
+                    },
+                    _ = queue.notify.notified() => continue,
+                },
             },
         };
+        let Queued { msg, wal_id } = item;
 
         // Capture the routing identifiers needed for an error reply *before* moving `msg`
         // into `handle_one_message`, so that if the future is cancelled we can still send
@@ -92,6 +175,11 @@ pub(super) async fn run_session_worker(
         match result {
             Ok(()) => {
                 consecutive_failures = 0;
+                // The reply (or the decision to ignore the message) landed: the
+                // WAL entry is no longer needed for crash recovery.
+                if let (Some(wal), Some(id)) = (wal.as_ref(), wal_id.as_deref()) {
+                    wal.complete(id);
+                }
             }
             Err(HandleError::Fatal(reason)) => {
                 error!(session_key = %key, reason = ?reason, "fatal CLI error; signalling bridge stop");
@@ -136,12 +224,18 @@ const MAX_SESSION_WORKERS: usize = 512;
 pub(super) struct SessionDispatcher {
     // std::sync::Mutex is correct here: the critical section contains only synchronous
     // HashMap operations (retain/get/insert) with no await points.
-    pub(super) senders: std::sync::Mutex<HashMap<String, mpsc::Sender<InboundMessage>>>,
+    pub(super) senders: std::sync::Mutex<HashMap<String, Arc<SessionQueue>>>,
     client: Arc<dyn Transport>,
     app: Arc<BridgeApp>,
     stop_tx: tokio::sync::watch::Sender<Option<BridgeStop>>,
     shutdown: CancellationToken,
-    /// Cumulative count of messages dropped because MAX_SESSION_WORKERS cap was reached.
+    /// Durable log of messages that were taken off the transport but not answered
+    /// yet. `None` when the WAL could not be opened: the bridge still runs, but a
+    /// crash loses in-flight messages again.
+    wal: Option<Wal>,
+    /// Cumulative count of messages that could not be dispatched because the
+    /// MAX_SESSION_WORKERS cap was reached. With a WAL attached the message is
+    /// on disk and is redelivered by the next run.
     /// Visible in structured logs via the warn! on each drop; exposed in the bridge
     /// metrics endpoint (TODO: requires a bridge-side HTTP server).
     sessions_dropped_on_cap: Arc<AtomicU64>,
@@ -160,11 +254,34 @@ impl SessionDispatcher {
             app,
             stop_tx,
             shutdown,
+            wal: None,
             sessions_dropped_on_cap: Arc::new(AtomicU64::new(0)),
         }
     }
 
+    /// Attach the write-ahead log this dispatcher records to / completes
+    /// against. Without one (tests, or an unopenable WAL directory) dispatch
+    /// still works, it just has no crash recovery.
+    pub(super) fn with_wal(mut self, wal: Option<Wal>) -> Self {
+        self.wal = wal;
+        self
+    }
+
     pub(super) async fn dispatch(&self, msg: InboundMessage) {
+        // Record *before* the message enters the queue: from here on the
+        // transport cursor has already been advanced past it, so disk is the
+        // only thing standing between a crash and a lost user message.
+        let wal_id = self.wal.as_ref().and_then(|wal| wal.record(&msg));
+        self.enqueue(msg, wal_id);
+    }
+
+    /// Re-dispatch a message recovered from the WAL. It is already on disk, so
+    /// the original entry id travels with it and is removed once answered.
+    pub(super) fn replay(&self, msg: InboundMessage, wal_id: String) {
+        self.enqueue(msg, Some(wal_id));
+    }
+
+    fn enqueue(&self, msg: InboundMessage, wal_id: Option<String>) {
         let key = session_dispatch_key(&msg);
 
         // N-04 / F-M1-N04: match the poison-safe style used by
@@ -174,7 +291,7 @@ impl SessionDispatcher {
 
         // Check if a live worker already exists for this key.
         let needs_new = match senders.get(&key) {
-            Some(tx) => tx.is_closed(),
+            Some(queue) => queue.tx.is_closed(),
             None => true,
         };
 
@@ -183,7 +300,7 @@ impl SessionDispatcher {
             // retain on every message. The background evict_closed_senders task
             // handles periodic cleanup so the map doesn't grow unbounded.
             if senders.len() >= MAX_SESSION_WORKERS {
-                senders.retain(|_, tx| !tx.is_closed());
+                senders.retain(|_, queue| !queue.tx.is_closed());
                 if senders.len() >= MAX_SESSION_WORKERS {
                     let total_dropped =
                         self.sessions_dropped_on_cap.fetch_add(1, Ordering::Relaxed) + 1;
@@ -192,35 +309,34 @@ impl SessionDispatcher {
                         cap = MAX_SESSION_WORKERS,
                         active = senders.len(),
                         sessions_dropped_on_cap = total_dropped,
-                        "session worker cap reached, dropping message"
+                        wal = self.wal.is_some(),
+                        "session worker cap reached, not dispatching this message"
                     );
                     return;
                 }
             }
             let (tx, rx) = mpsc::channel(DEFAULT_SESSION_QUEUE_SIZE);
-            senders.insert(key.clone(), tx.clone());
+            let queue = Arc::new(SessionQueue::new(tx));
+            senders.insert(key.clone(), Arc::clone(&queue));
             let client = self.client.clone();
             let app = Arc::clone(&self.app);
             let stop_tx = self.stop_tx.clone();
             let shutdown = self.shutdown.clone();
+            let wal = self.wal.clone();
             tokio::spawn(run_session_worker(
                 key.clone(),
                 rx,
+                queue,
                 client,
                 app,
                 stop_tx,
                 shutdown,
+                wal,
             ));
         }
 
-        if let Some(tx) = senders.get(&key) {
-            match tx.try_send(msg) {
-                Ok(_) => {}
-                Err(mpsc::error::TrySendError::Full(_)) => {
-                    warn!(session_key = %key, "session queue full, dropping message");
-                }
-                Err(mpsc::error::TrySendError::Closed(_)) => {}
-            }
+        if let Some(queue) = senders.get(&key) {
+            queue.push(Queued { msg, wal_id });
         }
     }
 
@@ -228,7 +344,7 @@ impl SessionDispatcher {
     /// so the map doesn't accumulate dead entries between cap-enforcement evictions.
     pub(super) fn evict_closed_senders(&self) {
         if let Ok(mut senders) = self.senders.lock() {
-            senders.retain(|_, tx| !tx.is_closed());
+            senders.retain(|_, queue| !queue.tx.is_closed());
         }
     }
 

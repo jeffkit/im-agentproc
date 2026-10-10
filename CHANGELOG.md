@@ -6,6 +6,30 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Inbound messages survive a crash (write-ahead log).** Taking a message off
+  the transport used to be an implicit acknowledgement: `getupdates` advances
+  the Hub cursor before the reply is sent, and Telegram confirms a batch only
+  through the next poll's `offset` — so a crash between "taken" and "answered"
+  lost the message for good. Every inbound message is now fsynced to
+  `~/.ilink-hub-bridge/wal/<profile>/` (override: `IM_AGENTPROC_WAL_DIR`)
+  *before* it is dispatched, the entry is deleted only once the reply was
+  confirmed delivered, and startup replays whatever is still there. Delivery is
+  now at-least-once instead of at-most-once.
+- **A full session queue no longer drops messages.** Messages that do not fit
+  `DEFAULT_SESSION_QUEUE_SIZE` are parked instead of being warned away, and the
+  worker drains them in arrival order once the channel empties.
+- **An abandoned final reply is reported as undelivered.** `send_final_with_retry`
+  returned `Ok(())` when the retry budget was exhausted or shutdown cancelled the
+  send, so the message counted as answered although the user never got it; it now
+  returns `Err`, which keeps the WAL entry pending for redelivery.
+- **Telegram polls resume from a persisted offset and drop re-delivered updates.**
+  The `getUpdates` offset is stored in
+  `~/.ilink-hub-bridge/transport-state/telegram-<token>.offset`, so a restart no
+  longer polls from `offset: 0` and re-runs an expensive CLI turn for a message
+  the user already got an answer to.
+
 ## [0.3.0] - 2026-09-16
 
 ### Added

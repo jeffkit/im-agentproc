@@ -44,6 +44,16 @@ bridge 是 IM-AgentProc 的核心：连 IM 传输、收入站消息、每条消�
 
 设 `permission: true` 开启可选的工具权限通道。bridge 写完 turn 对象后保持 agent 的 stdin 开着，翻译 agentproc `permission_request` / `permission_response` NDJSON 帧。bridge 对每个请求**恒 allow**——当前无 per-profile 策略。Claude Code 的 `--permission-prompt-tool stdio` 模式就是这样经 IM headless 驱动的。
 
+## 投递保证
+
+从 transport 取走消息是破坏性的——`getupdates` 在回复发出前就推进 Hub 游标，Telegram 只靠下一次 poll 的 `offset` 确认上一批——所以取走本身过去等同于确认。现在 bridge 为每个 profile 维护一份**预写日志**（`~/.ilink-hub-bridge/wal/<profile>/`，可用 `IM_AGENTPROC_WAL_DIR` 覆盖）：
+
+- 每条入站消息在**派发之前**先写入该日志（fsync 落盘）；
+- 只有回复被确认送达后才删除对应条目——被放弃的回复（重试预算耗尽，或 shutdown 取消了发送）会记日志并留在日志里；
+- 启动时把日志中仍然存在的消息重新派发。
+
+因此投递语义是**至少一次**：崩溃后一条消息可能被回答两次，但绝不会静默丢失。会话队列满也不再丢消息——溢出的消息被暂存，worker 腾出后按到达顺序重新注入。
+
 ## 优雅关闭
 
 Ctrl-C 和 SIGTERM 取消一个共享 shutdown token。在飞的 AI 调用被优雅取消并通知用户。bridge 最多等 3s 让错误回复发出，再 abort 任务。

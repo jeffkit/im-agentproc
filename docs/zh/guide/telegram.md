@@ -48,7 +48,7 @@ TELEGRAM_BOT_TOKEN=123456:ABCdef... \
 - **当前仅支持文本消息**。语音、图片、文档等类型会被忽略。
 - **防循环**：Bot 自身发出的消息自动丢弃。
 - **群聊**：需将 Bot 添加到群组。`session_id` 是 chat_id，每个会话独立维护 CLI 状态。
-- **偏移量**：`getUpdates` 偏移量仅在内存中保持。重启 Bridge 会重新处理未确认的消息。
+- **偏移量**：`getUpdates` 偏移量持久化在 `~/.ilink-hub-bridge/transport-state/`（按 Bot Token 区分），重启后从上次位置继续，而不是退回 `offset: 0` 重新拉取。低于该偏移量的更新会被丢弃：重复投递的批次不会对已经回复过的消息再跑一次 CLI。
 
 ## 常见问题
 

@@ -44,6 +44,16 @@ In default mode, before connecting to the Hub, the bridge runs a light probe on 
 
 Set `permission: true` to enable the optional tool-permission channel. The bridge keeps the agent's stdin open after the turn object and translates agentproc `permission_request` / `permission_response` NDJSON frames. The bridge **auto-approves** every request — there is no per-profile policy today. This is how Claude Code's `--permission-prompt-tool stdio` mode is driven headlessly through an IM.
 
+## Delivery guarantees
+
+Taking a message off a transport is destructive — `getupdates` advances the Hub cursor before the reply is sent, Telegram confirms a batch only through the next poll's `offset` — so it used to double as an acknowledgement. The bridge now keeps a per-profile **write-ahead log** (`~/.ilink-hub-bridge/wal/<profile>/`, override `IM_AGENTPROC_WAL_DIR`):
+
+- every inbound message is written (fsynced) there **before** it is dispatched;
+- the entry is deleted only once the reply was confirmed delivered — an abandoned reply (retry budget exhausted, or shutdown cancelled the send) is logged and left in the log;
+- on startup the bridge replays whatever is still there.
+
+Delivery is therefore **at-least-once**: a message can be answered twice after a crash, but it is never silently dropped. A full session queue does not drop messages either — the overflow is parked and re-injected in arrival order once the worker drains.
+
 ## Graceful shutdown
 
 Ctrl-C and SIGTERM cancel a shared shutdown token. In-flight AI calls are cancelled gracefully and users are notified. The bridge waits up to 3s for error replies to be sent before aborting the task.

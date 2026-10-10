@@ -1169,7 +1169,9 @@ async fn final_reply_transport_error_retried_then_succeeds() {
 async fn final_reply_transport_error_budget_exhausted_gives_up() {
     // With a zero-length budget, the budget check fires immediately
     // after the very first transport error and the helper gives up
-    // gracefully (Ok) without a second attempt.
+    // without a second attempt. Giving up means the user did NOT get the
+    // reply, so it must surface as Err — the caller then keeps the message
+    // in the WAL for redelivery instead of reporting it as answered.
     let scripted = ScriptedSender::new(vec![Err(anyhow::anyhow!("connection reset"))]);
     let shutdown = CancellationToken::new();
     // Duration::ZERO: any elapsed time satisfies `elapsed >= max_total`,
@@ -1184,8 +1186,8 @@ async fn final_reply_transport_error_budget_exhausted_gives_up() {
     )
     .await;
     assert!(
-        res.is_ok(),
-        "budget-exhausted transport error must give up with Ok, not propagate Err"
+        res.is_err(),
+        "budget-exhausted transport error must propagate Err (undelivered), not Ok"
     );
     assert_eq!(
         scripted.sent_count(),
@@ -1197,9 +1199,8 @@ async fn final_reply_transport_error_budget_exhausted_gives_up() {
 #[tokio::test]
 async fn final_reply_persistent_throttle_gives_up_within_budget() {
     // M4: under a permanent throttle the helper gives up once the
-    // cumulative budget is exhausted and returns Ok (the caller has
-    // nothing better to do than continue), rather than spinning
-    // forever.
+    // cumulative budget is exhausted rather than spinning forever — and
+    // reports the give-up as Err, because nothing reached the user.
     let scripted = ScriptedSender::new_loop(SendOutcome::Throttled {
         ret: -2,
         errmsg: None,
@@ -1222,8 +1223,8 @@ async fn final_reply_persistent_throttle_gives_up_within_budget() {
         "helper must return within the timeout (no infinite spin under persistent throttle)"
     );
     assert!(
-        res.unwrap().is_ok(),
-        "give-up returns Ok so the caller continues cleanly"
+        res.unwrap().is_err(),
+        "give-up must report the undelivered reply as Err"
     );
     assert!(
         scripted.sent_count() >= 1,
@@ -1234,7 +1235,9 @@ async fn final_reply_persistent_throttle_gives_up_within_budget() {
 #[tokio::test]
 async fn final_reply_shutdown_during_backoff_returns_promptly() {
     // Cancel-safety: a shutdown during the backoff sleep aborts the
-    // retry loop and returns Ok without hanging.
+    // retry loop and returns promptly. The reply was never confirmed, so
+    // the result is Err — the WAL entry stays pending and the message is
+    // redelivered by the next run.
     let scripted = ScriptedSender::new_loop(SendOutcome::Throttled {
         ret: -2,
         errmsg: None,
@@ -1257,7 +1260,7 @@ async fn final_reply_shutdown_during_backoff_returns_promptly() {
     shutdown.cancel();
     let res = tokio::time::timeout(Duration::from_secs(2), task).await;
     assert!(res.is_ok(), "task must finish promptly after shutdown");
-    assert!(res.unwrap().unwrap().is_ok());
+    assert!(res.unwrap().unwrap().is_err());
     let _ = probe.sent_count();
 }
 
@@ -1316,16 +1319,17 @@ async fn repro_e2e_codebuddy_block_on() {
     let _ = handle_one_message(&client, &app, msg, CancellationToken::new()).await;
 }
 
-// ─── [wip] issue #6: delivery semantics ─────────────────────────────
+// ─── issue #6: delivery semantics ───────────────────────────────────
 //
 // The acceptance criteria of issue #6 that can only be exercised through the
 // `pub(super)` dispatcher seams (`send_final_with_retry`, `SessionDispatcher`).
-// The end-to-end equivalents live in `tests/[wip]_issue6_delivery.rs`.
+// The end-to-end equivalents live in `tests/issue6_delivery.rs`.
 //
-// These tests FAIL on the current tree (they pin behaviour that does not exist
-// yet). Note that `final_reply_transport_error_budget_exhausted_gives_up` and
-// `final_reply_persistent_throttle_gives_up_within_budget` above pin the OLD
-// contract (`Ok` on give-up) and must be inverted by the same fix.
+// An abandoned final reply is no longer reported as success (see
+// `final_reply_transport_error_budget_exhausted_gives_up` /
+// `final_reply_persistent_throttle_gives_up_within_budget` above, which pin the
+// inverted contract), and a full session queue parks the message instead of
+// dropping it.
 
 /// Transport whose first `send_reply` parks until [`GatedSender::release`];
 /// every later send returns `Sent` immediately. Lets a test hold the session
@@ -1362,7 +1366,9 @@ impl Transport for GatedSender {
     }
 
     fn send_reply<'a>(&'a self, _reply: OutboundReply) -> BoxFuture<'a, Result<SendOutcome>> {
-        let n = self.attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let n = self
+            .attempts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let gate = self.gate.clone();
         Box::pin(async move {
             if n == 0 {
@@ -1428,9 +1434,8 @@ async fn wip_final_reply_persistent_throttle_exhaustion_is_reported_as_undeliver
     );
     assert!(
         res.is_err(),
-        "[wip] issue #6 acceptance 3: an abandoned final reply must not be reported as success \
-         (`return Ok(())` at send.rs:237) — it must return Err / be marked undelivered and enter \
-         the make-up/report path; got {res:?}"
+        "issue #6 acceptance 3: an abandoned final reply must not be reported as success — it \
+         must return Err so the caller keeps the message for redelivery; got {res:?}"
     );
 }
 
@@ -1457,16 +1462,14 @@ async fn wip_final_reply_transport_error_exhaustion_is_reported_as_undelivered()
     );
     assert!(
         res.is_err(),
-        "[wip] issue #6 acceptance 3: an abandoned final reply must not be reported as success \
-         (`return Ok(())` at send.rs:267) — it must return Err / be marked undelivered and enter \
-         the make-up/report path; got {res:?}"
+        "issue #6 acceptance 3: an abandoned final reply must not be reported as success — it \
+         must return Err so the caller keeps the message for redelivery; got {res:?}"
     );
 }
 
 /// Acceptance 2: when the session worker is busy, messages that overflow
-/// `DEFAULT_SESSION_QUEUE_SIZE` take the `try_send(Full)` path
-/// (session.rs:220). They must not be silently dropped: either re-injected
-/// (WAL) once the worker drains, or surfaced as an explicit failure.
+/// `DEFAULT_SESSION_QUEUE_SIZE` take the `try_send(Full)` path. They must not be
+/// silently dropped: they are parked and re-injected once the worker drains.
 #[tokio::test]
 async fn wip_session_queue_overflow_is_not_silently_dropped() {
     const QUEUE: usize = 200; // DEFAULT_SESSION_QUEUE_SIZE
@@ -1524,9 +1527,8 @@ async fn wip_session_queue_overflow_is_not_silently_dropped() {
 
     assert!(
         delivered >= total,
-        "[wip] issue #6 acceptance 2: only {delivered} of {total} messages were answered — the \
-         {QUEUE}+ messages overflowing the session queue were silently dropped \
-         (session.rs:220 `warn!(\"session queue full, dropping message\")`); they must enter the \
-         WAL and be re-injected once the worker drains, or be surfaced as an explicit failure"
+        "issue #6 acceptance 2: only {delivered} of {total} messages were answered — the \
+         {QUEUE}+ messages overflowing the session queue were silently dropped; they must be \
+         parked and re-injected once the worker drains"
     );
 }

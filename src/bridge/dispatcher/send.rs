@@ -201,9 +201,10 @@ pub(super) async fn run_partial_forward_loop(
 /// `cli_session_id` persistence and CLI-error reply each carry one fixed
 /// payload, so we just clone-and-resend the same `OutboundReply` until delivery.
 ///
-/// Returns `Ok(())` in all cases — on delivery, on a clean give-up after the
-/// budget is exhausted, or when `shutdown` fires. Callers that map the return
-/// value to `HandleError` can treat all outcomes as "best-effort sent; move on".
+/// Returns `Ok(())` **only** when the IM confirmed the send. Every give-up path
+/// (budget exhausted, shutdown) is an `Err`, because the user did not get the
+/// reply: callers must not report the message as handled, and the session worker
+/// keeps its WAL entry so the message is redelivered after a restart.
 pub(super) async fn send_final_with_retry(
     sender: &dyn Transport,
     reply: OutboundReply,
@@ -217,7 +218,7 @@ pub(super) async fn send_final_with_retry(
     loop {
         let send_result = tokio::select! {
             biased;
-            _ = shutdown.cancelled() => return Ok(()),
+            _ = shutdown.cancelled() => return Err(abandoned("shutdown before delivery")),
             r = sender.send_reply(reply.clone()) => r,
         };
         match send_result {
@@ -234,7 +235,9 @@ pub(super) async fn send_final_with_retry(
                         errmsg = sanitize_errmsg(errmsg.as_deref()).as_deref(),
                         "final reply abandoned: retry budget exhausted under persistent throttle"
                     );
-                    return Ok(());
+                    return Err(abandoned(
+                        "retry budget exhausted under persistent throttle",
+                    ));
                 }
                 attempt = attempt.saturating_add(1);
                 let wait = backoff_fn(attempt);
@@ -249,7 +252,7 @@ pub(super) async fn send_final_with_retry(
                 );
                 tokio::select! {
                     biased;
-                    _ = shutdown.cancelled() => return Ok(()),
+                    _ = shutdown.cancelled() => return Err(abandoned("shutdown during retry backoff")),
                     _ = tokio::time::sleep(wait) => {}
                 }
             }
@@ -264,7 +267,9 @@ pub(super) async fn send_final_with_retry(
                         error = %e,
                         "final reply abandoned: retry budget exhausted under persistent transport error"
                     );
-                    return Ok(());
+                    return Err(abandoned(
+                        "retry budget exhausted under persistent transport error",
+                    ));
                 }
                 attempt = attempt.saturating_add(1);
                 let wait = backoff_fn(attempt);
@@ -278,10 +283,14 @@ pub(super) async fn send_final_with_retry(
                 );
                 tokio::select! {
                     biased;
-                    _ = shutdown.cancelled() => return Ok(()),
+                    _ = shutdown.cancelled() => return Err(abandoned("shutdown during retry backoff")),
                     _ = tokio::time::sleep(wait) => {}
                 }
             }
         }
     }
+}
+
+fn abandoned(reason: &str) -> anyhow::Error {
+    anyhow::anyhow!("{reason}")
 }

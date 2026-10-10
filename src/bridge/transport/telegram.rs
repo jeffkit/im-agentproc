@@ -8,13 +8,18 @@
 //! - `token`: Telegram bot token from BotFather (e.g. `123456:ABCdef…`)
 //!
 //! The `buf` parameter stores the next polling offset as a decimal string.
-//! On first call `buf` is empty and the offset defaults to 0.
+//! On first call `buf` is empty, so the offset is resumed from the file the
+//! previous run persisted (keyed by bot token) and updates below that offset are
+//! dropped: Telegram acknowledges a batch only through the *next* poll, so a
+//! restart would otherwise re-deliver — and re-run the CLI for — messages the
+//! user already got an answer to.
 //!
 //! Media handling: photos, documents, audio, video and voice messages are
 //! downloaded to temp files and forwarded as `MediaRef` attachments.
 
-use std::time::Duration;
 use std::collections::HashMap;
+use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use futures_util::future::BoxFuture;
@@ -206,6 +211,43 @@ impl TelegramTransport {
         format!("{}/bot{}/{}", self.base_url, self.token, method)
     }
 
+    /// File holding the next `getUpdates` offset for this bot token.
+    ///
+    /// Keyed by the token (not the profile) because the offset belongs to the
+    /// bot: two profiles sharing a bot would otherwise poll the same update twice.
+    fn offset_state_path(&self) -> PathBuf {
+        let digest = md5::compute(self.token.as_bytes());
+        crate::paths::bridge_transport_state_dir().join(format!("telegram-{digest:x}.offset"))
+    }
+
+    /// Next offset recorded by an earlier run, or 0 when there is none.
+    fn persisted_offset(&self) -> i64 {
+        let path = self.offset_state_path();
+        match std::fs::read_to_string(&path) {
+            Ok(raw) => raw.trim().parse().unwrap_or(0),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(e) => {
+                warn!(path = %path.display(), error = %e, "cannot read the persisted Telegram offset; polling from 0");
+                0
+            }
+        }
+    }
+
+    /// Record the next offset. Best effort: a lost offset costs a duplicate
+    /// poll (de-duplicated in [`Self::get_updates`]), never a lost message.
+    fn persist_offset(&self, offset: i64) {
+        let path = self.offset_state_path();
+        if let Some(dir) = path.parent() {
+            if let Err(e) = std::fs::create_dir_all(dir) {
+                warn!(dir = %dir.display(), error = %e, "cannot create the Telegram state dir; the offset will not survive a restart");
+                return;
+            }
+        }
+        if let Err(e) = std::fs::write(&path, offset.to_string()) {
+            warn!(path = %path.display(), error = %e, "cannot persist the Telegram offset; it will not survive a restart");
+        }
+    }
+
     /// Resolve a `file_id` to a downloadable CDN URL via `getFile`.
     async fn get_file_url(&self, file_id: &str) -> Result<String> {
         let url = self.api_url(&format!("getFile?file_id={file_id}"));
@@ -267,6 +309,17 @@ impl TelegramTransport {
         let updates = resp.result.unwrap_or_default();
         let mut msgs: Vec<InboundMessage> = Vec::with_capacity(updates.len());
         for update in updates {
+            // Telegram re-sends updates that were not confirmed, and a restart
+            // without a persisted offset polls from 0 again: anything below the
+            // offset we asked for has already been handed to the dispatcher, and
+            // delivering it twice would re-run an expensive CLI turn.
+            if update.update_id < offset {
+                debug!(
+                    update_id = update.update_id,
+                    offset, "dropping already-delivered Telegram update"
+                );
+                continue;
+            }
             if let Some(inbound) = self.tg_update_to_inbound(update).await {
                 msgs.push(inbound);
             }
@@ -420,23 +473,30 @@ impl TelegramTransport {
 impl Transport for TelegramTransport {
     fn next_inbound<'a>(&'a self, buf: &'a mut String) -> BoxFuture<'a, Result<InboundOutcome>> {
         Box::pin(async move {
-            // `buf` stores the next offset as a decimal string.
-            let offset: i64 = buf.trim().parse().unwrap_or(0);
+            // `buf` stores the next offset as a decimal string. A fresh process
+            // starts from an empty cursor, so resume from the persisted offset —
+            // otherwise the restart re-polls updates the user already got an
+            // answer to.
+            let in_memory: i64 = buf.trim().parse().unwrap_or(0);
+            let offset = in_memory.max(self.persisted_offset());
+            if offset != in_memory {
+                *buf = offset.to_string();
+            }
+
             let outcome = self.get_updates(offset).await?;
 
             // Advance the offset past the highest update_id we've seen.
             if let InboundOutcome::Messages(ref msgs) = outcome {
+                let mut next = offset;
                 for msg in msgs {
-                    if let Some(extra) = msg.extra.get("update_id") {
-                        if let Some(uid) = extra.as_i64() {
-                            let next = uid + 1;
-                            let cur: i64 = buf.trim().parse().unwrap_or(0);
-                            if next > cur {
-                                *buf = next.to_string();
-                            }
-                        }
+                    if let Some(uid) = msg.extra.get("update_id").and_then(|v| v.as_i64()) {
+                        next = next.max(uid.saturating_add(1));
                     }
                 }
+                if next != offset {
+                    self.persist_offset(next);
+                }
+                *buf = next.to_string();
                 debug!(count = msgs.len(), next_offset = %buf, "Telegram getUpdates");
             }
             Ok(outcome)
