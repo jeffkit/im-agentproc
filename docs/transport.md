@@ -174,7 +174,7 @@ run_bridge_reconnecting(BridgeRunOptions {
 }).await
 ```
 
-A complete compilable example lives in [`examples/custom_transport_main.rs`](../examples/custom_transport_main.rs). The shipped `im-agentproc` binary uses the exact same entry with `with_builtins()`.
+A complete compilable example lives in [`examples/custom_transport_main.rs`](https://github.com/jeffkit/im-agentproc/blob/main/examples/custom_transport_main.rs). The shipped `im-agentproc` binary uses the exact same entry with `with_builtins()`.
 
 ### MCP outbound subprocess
 
